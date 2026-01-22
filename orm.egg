@@ -1,0 +1,12 @@
+;;; orm.egg - ORM (Object-Relational Mapping) for CHICKEN Scheme
+
+((synopsis "Simple ORM with define-model macro for CHICKEN Scheme")
+ (author "Rolando Abarca")
+ (version "0.0.1")
+ (license "BSD-3-Clause")
+ (category db)
+ (dependencies srfi-1 srfi-13 srfi-133 orm.db logger)
+ (test-dependencies)
+ (components
+  (extension orm
+    (source "orm.scm"))))

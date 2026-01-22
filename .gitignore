@@ -1,0 +1,24 @@
+# CHICKEN Scheme compiled files
+*.o
+*.so
+*.import.scm
+*.link
+*.build.sh
+*.install.sh
+*.types
+
+# Egg build artifacts
+salmonella.log
+*.egg-locations
+*.egg-info
+
+# Editor files
+*~
+*.swp
+*.swo
+.idea/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
