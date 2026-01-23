@@ -1,7 +1,7 @@
-;; orm.db.sqlite.scm - SQLite3 backend for orm.db
+;; orm-db-sqlite.scm - SQLite3 backend for orm-db
 ;; Uses the sqlite3 egg for direct database access.
 
-(module orm.db.sqlite
+(module orm-db-sqlite
 
 (
  sqlite3-backend

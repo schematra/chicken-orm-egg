@@ -36,7 +36,7 @@
  srfi-1
  srfi-13
  (only srfi-133 vector-map)
- orm.db
+ orm-db
  logger
  )
 

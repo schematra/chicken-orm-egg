@@ -1,4 +1,4 @@
-;;; orm.db.egg - Abstract database interface for CHICKEN Scheme
+;;; orm-db.egg - Abstract database interface for CHICKEN Scheme
 
 ((synopsis "Abstract database interface with pluggable backends")
  (author "Rolando Abarca")
@@ -8,5 +8,5 @@
  (dependencies)
  (test-dependencies)
  (components
-  (extension orm.db
-    (source "orm.db.scm"))))
+  (extension orm-db
+    (source "orm-db.scm"))))

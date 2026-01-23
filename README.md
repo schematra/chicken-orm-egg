@@ -6,21 +6,21 @@ A simple ORM (Object-Relational Mapping) for CHICKEN Scheme with support for mod
 
 This repository contains three eggs:
 
-- **orm.db** - Abstract database interface with pluggable backends
-- **orm.db.sqlite** - SQLite3 backend for orm.db
+- **orm-db** - Abstract database interface with pluggable backends
+- **orm-db-sqlite** - SQLite3 backend for orm-db
 - **orm** - The ORM itself (models, migrations, relationships)
 
 ## Installation
 
 ```scheme
 chicken-install orm
-chicken-install orm.db.sqlite  ; if using SQLite
+chicken-install orm-db-sqlite  ; if using SQLite
 ```
 
 ## Quick Start
 
 ```scheme
-(import orm.db orm.db.sqlite orm)
+(import orm-db orm-db-sqlite orm)
 
 ;; Configure and connect to database
 (db/backend (sqlite3-backend))
@@ -42,7 +42,7 @@ chicken-install orm.db.sqlite  ; if using SQLite
 ### Configuring the Backend
 
 ```scheme
-(import orm.db orm.db.sqlite)
+(import orm-db orm-db-sqlite)
 
 ;; Set the backend (must be done before connecting)
 (db/backend (sqlite3-backend))

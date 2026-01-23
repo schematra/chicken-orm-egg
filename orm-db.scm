@@ -1,9 +1,9 @@
-;; orm.db.scm - Abstract database interface
+;; orm-db.scm - Abstract database interface
 ;; Provides a backend-agnostic interface for database operations.
-;; Backends (like orm.db.sqlite or orm.db.rqlite) register themselves and
+;; Backends (like orm-db-sqlite or orm-db-rqlite) register themselves and
 ;; implement connect, close, query, and execute operations.
 
-(module orm.db
+(module orm-db
 
 (
  db/backend
