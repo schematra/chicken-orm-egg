@@ -1,0 +1,12 @@
+;;; orm-db-rqlite.egg - rqlite backend for orm-db egg
+
+((synopsis "rqlite backend for the orm-db abstract database interface")
+ (author "Rolando Abarca")
+ (version "0.0.3")
+ (license "BSD-3-Clause")
+ (category db)
+ (dependencies orm-db ssql http-client uri-common intarweb medea logger)
+ (test-dependencies)
+ (components
+  (extension orm-db-rqlite
+    (source "orm-db-rqlite.scm"))))
