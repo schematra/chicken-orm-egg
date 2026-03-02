@@ -49,13 +49,13 @@
          (first-res (and (vector? results)
                          (> (vector-length results) 0)
                          (vector-ref results 0)))
-         (error     (and first-res (alist-ref 'error first-res)))
+         (err       (and first-res (alist-ref 'error first-res)))
          (out-val   (and first-res (alist-ref out-key first-res))))
     (d "response: " resp)
-    (if error
+    (if err
         (begin
-          (e "rqlite error: " error)
-          (error 'rqlite error))
+          (e "rqlite error: " err)
+          (error 'rqlite err))
         out-val)))
 
 ;; Execute a query and return results as vector of alists
