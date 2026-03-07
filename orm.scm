@@ -221,7 +221,7 @@
                    (,%map ,%car (get-primary-key-columns (,columns-name))))
 
          ;; Where function - returns vector of alists
-         (,%define (,where-name #!optional conditions (values '()) #!key (limit #f) (order #f))
+         (,%define (,where-name #!optional conditions (values '()) #!key (limit #f) (order #f) (offset #f))
                    (,%let* ((columns (,%map ,%car (,columns-name)))
                             (db-columns (,%map (,(r 'lambda) (col-spec)
                                                 (symbol->db-column col-spec)) columns))
@@ -245,12 +245,13 @@
                                             (from ,db-table-name)
                                             ,@(,(r 'if) conditions `((where ,(map-field-names->columns conditions columns))) '())
                                             ,@(,(r 'if) converted-order `((order ,converted-order)) '())
-                                            ,@(,(r 'if) limit `((limit ,limit)) '()))))
+                                            ,@(,(r 'if) limit `((limit ,limit)) '())
+                                            ,@(,(r 'if) offset `((offset ,offset)) '()))))
                            (convert-results-vector (db/query query-parts values))))
 
          ;; Convenience "all" search
-         (,%define (,all-name #!key (limit #f) (order #f))
-                   (,where-name #f '() limit: limit order: order))
+         (,%define (,all-name #!key (limit #f) (order #f) (offset #f))
+                   (,where-name #f '() limit: limit order: order offset: offset))
 
          ;; Find function - returns single alist or #f
          (,%define (,find-name #!optional conditions (values '()) #!key (order #f))
@@ -374,7 +375,7 @@
          (,(r 'export) ,parent-get-children-name ,child-get-parent-name ,parent-add-child-name)
 
          ;; Parent -> Children (e.g., users/sessions) - returns list
-         (,(r 'define) (,parent-get-children-name parent-row #!optional conditions (values '()))
+         (,(r 'define) (,parent-get-children-name parent-row #!optional conditions (values '()) #!key (limit #f) (order #f) (offset #f))
           (,%let* ((fk-column ',fk-column)
 		   (parent-pk (,(r 'alist-ref) 'id parent-row))
                    (base-condition `(= ,fk-column ?))
@@ -385,7 +386,7 @@
                    (full-values (,(r 'if) conditions
                                  (,(r 'append) base-values values)
                                  base-values)))
-		  (,child-where-name full-condition full-values)))
+		  (,child-where-name full-condition full-values limit: limit order: order offset: offset)))
 
          ;; Child -> Parent (e.g., sessions/user) - returns single element or #f
          (,(r 'define) (,child-get-parent-name child-row)
