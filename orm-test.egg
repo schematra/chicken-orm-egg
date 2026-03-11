@@ -1,0 +1,12 @@
+;;; orm-test.egg - Test helpers for the orm egg
+
+((synopsis "Test helpers for the orm egg")
+ (author "Rolando Abarca")
+ (version "0.0.6")
+ (license "BSD-3-Clause")
+ (category testing)
+ (dependencies)
+ (test-dependencies)
+ (components
+  (extension orm-test
+    (source "orm-test.scm"))))
