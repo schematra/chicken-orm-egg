@@ -4,11 +4,12 @@ A simple ORM (Object-Relational Mapping) for CHICKEN Scheme with support for mod
 
 ## Eggs
 
-This repository contains three eggs:
+This repository contains four eggs:
 
 - **orm-db** - Abstract database interface with pluggable backends
 - **orm-db-sqlite** - SQLite3 backend for orm-db
 - **orm** - The ORM itself (models, migrations, relationships)
+- **orm-test** - Mock backend for testing ORM code without a real database
 
 ## Installation
 
@@ -345,6 +346,67 @@ For tables with a `metadata` TEXT column storing s-expressions:
 ;; DB column to Scheme symbol (snake_case -> kebab-case)
 (db-column->symbol 'created_at)  ; => created-at
 (db-column->symbol "created_at") ; => created-at
+```
+
+## Testing with orm-test
+
+The `orm-test` egg provides a mock database backend for testing code that uses `orm-db` without requiring a real database connection.
+
+### Installation
+
+```scheme
+chicken-install orm-test
+```
+
+### make-mock-backend
+
+`make-mock-backend` returns two values: a backend (compatible with `db/backend`) and a spy procedure for inspecting and controlling the mock.
+
+```scheme
+(import orm-db orm-test)
+
+(receive (backend spy) (make-mock-backend)
+  ;; Use the mock backend instead of a real one
+  (db/backend backend)
+  (db/path "ignored")
+  (db/connect)
+
+  ;; Configure responses for queries
+  (spy 'on-query (list (vector '((id . 1) (name . "Alice")))))
+
+  ;; Now any query will return the configured response
+  (users/all)  ; => #(((id . 1) (name . "Alice")))
+
+  ;; Inspect what SQL was executed
+  (spy 'queries)  ; => (("SELECT ..." ()))
+  )
+```
+
+### Spy Messages
+
+| Message | Arguments | Description |
+|---------|-----------|-------------|
+| `queries` | none | Returns list of `(sql params)` pairs from all queries |
+| `executions` | none | Returns list of `(sql params out-key)` from all executions |
+| `on-query` | responses-or-proc | Set query responses: a list (consumed in order, last repeats) or a `(lambda (sql params) ...)` |
+| `on-execute` | responses-or-proc | Set execute responses: a list or a `(lambda (sql params out-key) ...)` |
+| `reset!` | none | Clear recorded queries and executions |
+
+### Configuring Responses
+
+Responses can be a list (each call consumes the next item; the last item repeats forever) or a procedure for dynamic responses:
+
+```scheme
+;; Static list of responses
+(spy 'on-query (list
+  (vector '((id . 1) (name . "Alice")))   ; first query returns this
+  (vector)))                                ; all subsequent queries return empty
+
+;; Dynamic responses
+(spy 'on-query (lambda (sql params)
+  (if (string-contains sql "users")
+      (vector '((id . 1) (name . "Alice")))
+      (vector))))
 ```
 
 ## License
