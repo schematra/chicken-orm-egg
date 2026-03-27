@@ -38,6 +38,7 @@
  (only srfi-133 vector-map)
  orm-db
  logger
+ sql-null
  )
 
 ;; Import chicken.base for make-list at expansion time as well
@@ -151,7 +152,8 @@
   (let ((pair (assoc key row)))
     (if pair
         ;; Key exists, check if value is SQL NULL
-        (if (eq? (cdr pair) 'null)
+        (if (or (eq? (cdr pair) 'null)
+                (sql-null? (cdr pair)))
             default
             (cdr pair))
         ;; Key doesn't exist, error out
