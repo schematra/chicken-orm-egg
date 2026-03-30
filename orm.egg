@@ -2,10 +2,10 @@
 
 ((synopsis "Simple ORM with define-model macro for CHICKEN Scheme")
  (author "Rolando Abarca")
- (version "0.0.7")
+ (version "0.0.8")
  (license "BSD-3-Clause")
  (category db)
- (dependencies srfi-1 srfi-13 srfi-133 orm-db logger)
+ (dependencies srfi-1 srfi-13 srfi-133 orm-db logger sql-null)
  (test-dependencies)
  (components
   (extension orm
