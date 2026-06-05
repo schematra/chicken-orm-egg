@@ -16,6 +16,7 @@
  model/migration
  model/migrate
  model/rollback-all!
+ column-spec->sql
  model/schema/create-table
  model/schema/drop-table
  model/schema/add-columns
@@ -525,46 +526,66 @@
     ((boolean) "BOOLEAN")
     (else (symbol->string col-type))))
 
+;; Render a DEFAULT clause from a default value, or #f if none given.
+;; options is the cddr of a column spec; (default <val>) appears as (default . (<val>)).
+(define (column-default->sql options)
+  (let ((default-list (alist-ref 'default options)))
+    (if default-list
+        (let ((default (car default-list)))
+          (cond
+           ;; Handle string literals - wrap in SQL single quotes
+           ((string? default)
+            (conc "DEFAULT '" default "'"))
+           ;; Handle boolean values - convert to SQL TRUE/FALSE
+           ((boolean? default)
+            (conc "DEFAULT " (if default "TRUE" "FALSE")))
+           ;; Everything else (symbols, numbers) as-is
+           (else
+            (conc "DEFAULT " default))))
+        #f)))
+
+;; Build the list of constraint SQL fragments for a column spec's options.
+;; When alter? is true, reject the constraints SQLite forbids on ADD COLUMN
+;; (PRIMARY KEY, UNIQUE, AUTOINCREMENT) rather than silently emitting invalid SQL.
+;; See https://sqlite.org/lang_altertable.html for the full set of restrictions.
+(define (column-options->constraints options #!optional alter?)
+  (when alter?
+    (cond
+     ((alist-ref 'primary-key options)
+      (error "ALTER TABLE ADD COLUMN cannot add a PRIMARY KEY column" options))
+     ((alist-ref 'unique options)
+      (error "ALTER TABLE ADD COLUMN cannot add a UNIQUE column" options))
+     ((alist-ref 'autoincrement options)
+      (error "ALTER TABLE ADD COLUMN cannot add an AUTOINCREMENT column" options))))
+  (filter identity
+          (list
+           (if (alist-ref 'primary-key options) "PRIMARY KEY" #f)
+           (if (alist-ref 'autoincrement options) "AUTOINCREMENT" #f)
+           (if (alist-ref 'not-null options) "NOT NULL" #f)
+           (if (alist-ref 'unique options) "UNIQUE" #f)
+           (column-default->sql options)
+           (let ((foreign-key-list (alist-ref 'foreign-key options)))
+             (if foreign-key-list
+                 (let ((fk-table (car foreign-key-list))
+                       (fk-column (cadr foreign-key-list)))
+                   (conc "REFERENCES " fk-table "(" fk-column ")"))
+                 #f)))))
+
+;; Render a single column spec (name type . options) into a SQL column definition.
+;; alter? toggles the ADD COLUMN constraint restrictions.
+(define (column-spec->sql spec #!optional alter?)
+  (let* ((col-name (car spec))
+         (col-type (cadr spec))
+         (options (cddr spec))
+         (type-sql (column-type->sql col-type))
+         (constraints (string-intersperse
+                       (column-options->constraints options alter?) " ")))
+    (conc (symbol->string col-name) " " type-sql
+          (if (string=? constraints "") "" (conc " " constraints)))))
+
 (define (model/schema/create-table table-name . column-specs)
   "Create table with column specifications"
-  (let* ((columns-sql
-          (map (lambda (spec)
-                 (let* ((col-name (car spec))
-                        (col-type (cadr spec))
-                        (options (cddr spec))
-                        (type-sql (column-type->sql col-type))
-                        (constraints
-                         (string-intersperse
-                          (filter identity
-                                  (list
-                                   (if (alist-ref 'primary-key options) "PRIMARY KEY" #f)
-                                   (if (alist-ref 'autoincrement options) "AUTOINCREMENT" #f)
-                                   (if (alist-ref 'not-null options) "NOT NULL" #f)
-                                   (if (alist-ref 'unique options) "UNIQUE" #f)
-                                   (let ((default-list (alist-ref 'default options)))
-                                     (if default-list
-                                         (let ((default (car default-list)))
-                                           (cond
-                                            ;; Handle string literals - wrap in SQL single quotes
-                                            ((string? default)
-                                             (conc "DEFAULT '" default "'"))
-                                            ;; Handle boolean values - convert to SQL TRUE/FALSE
-                                            ((boolean? default)
-                                             (conc "DEFAULT " (if default "TRUE" "FALSE")))
-                                            ;; Everything else (symbols, numbers) as-is
-                                            (else
-                                             (conc "DEFAULT " default))))
-                                         #f))
-                                   (let ((foreign-key-list (alist-ref 'foreign-key options)))
-                                     (if foreign-key-list
-                                         (let ((fk-table (car foreign-key-list))
-                                               (fk-column (cadr foreign-key-list)))
-                                           (conc "REFERENCES " fk-table "(" fk-column ")"))
-                                         #f))))
-                          " ")))
-                   (conc (symbol->string col-name) " " type-sql
-                         (if (string=? constraints "") "" (conc " " constraints)))))
-               column-specs))
+  (let* ((columns-sql (map column-spec->sql column-specs))
          (sql (conc "CREATE TABLE " (symbol->string table-name) " ("
                     (string-intersperse columns-sql ", ") ")")))
     (db/execute sql)))
@@ -575,15 +596,15 @@
     (db/execute sql)))
 
 (define (model/schema/add-columns table-name . column-specs)
-  "Add columns to existing table"
+  "Add columns to existing table.
+   Honors the same options as create-table (default, not-null, foreign-key),
+   subject to SQLite's ADD COLUMN restrictions: NOT NULL requires a non-NULL
+   default, REFERENCES requires a NULL default, and PRIMARY KEY/UNIQUE/
+   AUTOINCREMENT are rejected outright."
   (for-each
    (lambda (spec)
-     (let* ((col-name (car spec))
-            (col-type (cadr spec))
-            (options (cddr spec))
-            (type-sql (column-type->sql col-type))
-            (sql (conc "ALTER TABLE " (symbol->string table-name)
-                      " ADD COLUMN " (symbol->string col-name) " " type-sql)))
+     (let ((sql (conc "ALTER TABLE " (symbol->string table-name)
+                      " ADD COLUMN " (column-spec->sql spec #t))))
        (db/execute sql)))
    column-specs))
 

@@ -74,6 +74,42 @@
     (alist-ref 'metadata
                (row-metadata-set! '((name . "test")) '((key . "value"))))))
 
+(test-group "column-spec->sql"
+  (test "plain column"
+    "name TEXT" (column-spec->sql '(name text)))
+  (test "primary key + autoincrement"
+    "id INTEGER PRIMARY KEY AUTOINCREMENT"
+    (column-spec->sql '(id integer (primary-key #t) (autoincrement #t))))
+  (test "not-null"
+    "title TEXT NOT NULL" (column-spec->sql '(title text (not-null #t))))
+  (test "unique"
+    "email TEXT UNIQUE" (column-spec->sql '(email text (unique #t))))
+  (test "string default is quoted"
+    "status TEXT DEFAULT 'active'"
+    (column-spec->sql '(status text (default "active"))))
+  (test "boolean default becomes TRUE/FALSE"
+    "enabled BOOLEAN DEFAULT FALSE"
+    (column-spec->sql '(enabled boolean (default #f))))
+  (test "numeric default emitted as-is"
+    "count INTEGER DEFAULT 0"
+    (column-spec->sql '(count integer (default 0))))
+  (test "not-null with default"
+    "status TEXT NOT NULL DEFAULT 'active'"
+    (column-spec->sql '(status text (not-null #t) (default "active"))))
+  (test "foreign key references"
+    "user_id INTEGER REFERENCES users(id)"
+    (column-spec->sql '(user_id integer (foreign-key users id))))
+  ;; ALTER TABLE ADD COLUMN restrictions (alter? = #t)
+  (test "alter mode emits supported constraints"
+    "status TEXT NOT NULL DEFAULT 'active'"
+    (column-spec->sql '(status text (not-null #t) (default "active")) #t))
+  (test-error "alter mode rejects primary-key"
+    (column-spec->sql '(id integer (primary-key #t)) #t))
+  (test-error "alter mode rejects unique"
+    (column-spec->sql '(email text (unique #t)) #t))
+  (test-error "alter mode rejects autoincrement"
+    (column-spec->sql '(id integer (autoincrement #t)) #t)))
+
 ;; --- Integration tests (require SQLite) ---
 
 (test-group "orm integration (sqlite)"
@@ -162,6 +198,21 @@
     ;; Verify table was created by querying it
     (test-assert "migration created posts table"
       (vector? (db/query "SELECT * FROM posts")))
+
+    ;; add-columns must honor options (default/not-null), not just type
+    (db/execute "INSERT INTO posts (title, body) VALUES ('hello', 'world')")
+    (model/schema/add-columns 'posts
+      '(status text (not-null #t) (default "draft"))
+      '(view_count integer (default 0)))
+
+    (let ((row (vector-ref (db/query "SELECT status, view_count FROM posts") 0)))
+      (test "add-columns applies string default to existing rows"
+        "draft" (alist-ref 'status row))
+      (test "add-columns applies numeric default to existing rows"
+        0 (alist-ref 'view_count row)))
+
+    (test-error "add-columns rejects primary-key on existing table"
+      (model/schema/add-columns 'posts '(pk integer (primary-key #t))))
 
     (model/rollback-all!)
 
