@@ -4,13 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ORM for CHICKEN Scheme 5 with pluggable database backends. The repo contains three separate eggs (packages) in a single flat directory:
+ORM for CHICKEN Scheme 5 with pluggable database backends. The repo contains three eggs (packages) in a single flat directory:
 
-- **orm-db** (`orm-db.scm`, `orm-db.egg`) - Abstract database interface using parameters and alist-based backend dispatch
-- **orm-db-sqlite** (`orm-db-sqlite.scm`, `orm-db-sqlite.egg`) - SQLite3 backend
-- **orm-db-rqlite** (`orm-db-rqlite.scm`, `orm-db-rqlite.egg`) - rqlite (HTTP-based distributed SQLite) backend
-- **orm** (`orm.scm`, `orm.egg`) - Core ORM with `define-model` macro, migrations, relationships
-- **orm-test** (`orm-test.scm`, `orm-test.egg`) - Test helpers with `make-mock-backend` for mocking the DB layer
+- **orm** (`orm.egg`) - Bundles three modules so the lightweight, pure-Scheme pieces install as one unit:
+  - `orm-db` (`orm-db.scm`) - Abstract database interface using parameters and alist-based backend dispatch
+  - `orm` (`orm.scm`) - Core ORM with `define-model` macro, migrations, relationships
+  - `orm-test` (`orm-test.scm`) - Test helpers with `make-mock-backend` for mocking the DB layer
+- **orm-db-sqlite** (`orm-db-sqlite.scm`, `orm-db-sqlite.egg`) - SQLite3 backend (depends on `orm` + `sqlite3`)
+- **orm-db-rqlite** (`orm-db-rqlite.scm`, `orm-db-rqlite.egg`) - rqlite (HTTP-based distributed SQLite) backend (depends on `orm` + the HTTP/JSON stack)
+
+The backends stay separate eggs because each pulls heavy, mutually-exclusive dependencies (`sqlite3` C binding vs. the `http-client`/`medea`/`intarweb`/`uri-common` stack), and CHICKEN `.egg` files have no per-component optional dependencies. Module names are unchanged, so consumer `(import orm-db)` / `(import orm-test)` still work — only the install unit changed.
 
 ## Build & Install
 

@@ -5,7 +5,7 @@
  (version "0.0.6")
  (license "BSD-3-Clause")
  (category db)
- (dependencies orm-db ssql http-client uri-common intarweb medea logger)
+ (dependencies orm ssql http-client uri-common intarweb medea logger)
  (test-dependencies)
  (components
   (extension orm-db-rqlite

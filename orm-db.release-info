@@ -1,2 +1,0 @@
-(uri targz "https://forgejo.rolando.cl/cpm/orm-egg/archive/v{egg-release}.tar.gz")
-(release "0.0.6")

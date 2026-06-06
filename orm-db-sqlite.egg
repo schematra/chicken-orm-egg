@@ -5,7 +5,7 @@
  (version "0.0.6")
  (license "BSD-3-Clause")
  (category db)
- (dependencies orm-db sqlite3 ssql logger)
+ (dependencies orm sqlite3 ssql logger)
  (test-dependencies)
  (components
   (extension orm-db-sqlite
