@@ -4,18 +4,25 @@ A simple ORM (Object-Relational Mapping) for CHICKEN Scheme with support for mod
 
 ## Eggs
 
-This repository contains four eggs:
+This repository contains three eggs:
 
-- **orm-db** - Abstract database interface with pluggable backends
-- **orm-db-sqlite** - SQLite3 backend for orm-db
-- **orm** - The ORM itself (models, migrations, relationships)
-- **orm-test** - Mock backend for testing ORM code without a real database
+- **orm** - The ORM itself (models, migrations, relationships). Bundles three modules:
+  - `orm` - the ORM (models, migrations, relationships)
+  - `orm-db` - abstract database interface with pluggable backends
+  - `orm-test` - mock backend for testing ORM code without a real database
+- **orm-db-sqlite** - SQLite3 backend
+- **orm-db-rqlite** - rqlite (HTTP-based distributed SQLite) backend
+
+The backends are separate eggs because each pulls heavy, mutually-exclusive
+dependencies — install only the one you need. Module names are unchanged:
+`(import orm-db)` and `(import orm-test)` work as before.
 
 ## Installation
 
 ```scheme
 chicken-install orm
 chicken-install orm-db-sqlite  ; if using SQLite
+chicken-install orm-db-rqlite  ; if using rqlite
 ```
 
 ## Quick Start
@@ -350,13 +357,7 @@ For tables with a `metadata` TEXT column storing s-expressions:
 
 ## Testing with orm-test
 
-The `orm-test` egg provides a mock database backend for testing code that uses `orm-db` without requiring a real database connection.
-
-### Installation
-
-```scheme
-chicken-install orm-test
-```
+The `orm-test` module (bundled in the `orm` egg) provides a mock database backend for testing code that uses `orm-db` without requiring a real database connection. It's installed automatically with `orm` — no separate install needed.
 
 ### make-mock-backend
 
