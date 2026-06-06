@@ -244,6 +244,39 @@ The ORM includes a simple migration system for managing schema changes.
 (model/rollback-all!)
 ```
 
+### Running Migrations from the CLI
+
+The `orm` egg installs an `orm-migrate` program that runs migrations without
+writing a driver script. Point it at a migrations file — a plain Scheme file
+containing `(model/migration ...)` forms (no imports needed; `orm` is in scope)
+— and select the backend at runtime:
+
+```sh
+# Apply all migrations up to the latest
+orm-migrate -b sqlite -path myapp.db -f migrations.scm
+
+# Migrate up or down to a specific version
+orm-migrate -b sqlite -path myapp.db -f migrations.scm -m 001-create-users
+
+# Roll everything back to a clean state
+orm-migrate -b sqlite -path myapp.db -f migrations.scm --rollback
+
+# rqlite: -path is the HTTP connection string (keep credentials off disk)
+orm-migrate -b rqlite -path "https://user:pass@host:4001" -f migrations.scm
+```
+
+| Flag | Description |
+| --- | --- |
+| `-b`, `--backend` | Backend to use: `sqlite` or `rqlite` (required) |
+| `-path`, `--path` | Database path / connection string (required) |
+| `-f`, `--file` | Migrations file with `(model/migration ...)` forms (required) |
+| `-m`, `--migration` | Target version; migrates up or down to it (default: latest) |
+| `--rollback` | Roll back all migrations |
+| `-h`, `--help` | Show usage |
+
+The backend egg (`orm-db-sqlite` or `orm-db-rqlite`) is imported dynamically, so
+it must be installed, but the `orm` egg keeps no static dependency on either.
+
 ### Schema Helpers
 
 ```scheme

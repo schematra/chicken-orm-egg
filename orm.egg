@@ -15,4 +15,7 @@
   (extension orm
     (source "orm.scm"))
   (extension orm-test
-    (source "orm-test.scm"))))
+    (source "orm-test.scm"))
+  (program orm-migrate
+    (source "orm-migrate.scm")
+    (component-dependencies orm orm-db))))

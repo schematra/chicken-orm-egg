@@ -12,6 +12,9 @@ salmonella.log
 *.egg-locations
 *.egg-info
 
+# Compiled program binaries (no extension)
+orm-migrate
+
 # Editor files
 *~
 *.swp

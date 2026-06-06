@@ -1,0 +1,540 @@
+== ORM
+
+A simple ORM (Object-Relational Mapping) for CHICKEN Scheme with support for models, migrations, and relationships.
+
+=== Description
+
+The {{orm}} egg is a lightweight ORM for CHICKEN Scheme built around a {{define-model}} macro that introspects an existing table at runtime and generates a full set of CRUD functions. It features a backend-agnostic database layer, a small migration system with a companion CLI runner, has-many relationships, and automatic kebab-case ↔ snake_case name conversion.
+
+The egg bundles three modules so the lightweight, pure-Scheme pieces install as one unit:
+
+* {{orm}} — the core ORM: models, migrations, relationships
+* {{orm-db}} — the abstract, backend-agnostic database interface
+* {{orm-test}} — a mock backend for testing ORM code without a real database
+
+A database backend is installed separately as its own egg, because each pulls heavy, mutually-exclusive dependencies:
+
+* [[orm-db-sqlite]] — SQLite3 backend
+* [[orm-db-rqlite]] — rqlite (HTTP-based distributed SQLite) backend
+
+=== Requirements
+
+* CHICKEN Scheme 5.0 or later
+* Dependencies: srfi-1, srfi-13, srfi-133, logger, sql-null
+* A backend egg ([[orm-db-sqlite]] or [[orm-db-rqlite]]) to connect to a real database
+
+=== Installation
+
+<enscript highlight="bash">
+chicken-install orm
+chicken-install orm-db-sqlite   ; if using SQLite
+chicken-install orm-db-rqlite   ; if using rqlite
+</enscript>
+
+=== Basic Usage
+
+<enscript highlight="scheme">
+(import orm-db orm-db-sqlite orm)
+
+;; Configure and connect to a database
+(db/backend (sqlite3-backend))
+(db/path "myapp.db")
+(db/connect)
+
+;; Define a model bound to an existing table
+(define-model users)
+
+;; Query
+(users/all)                    ; => #(((id . 1) (name . "Alice") ...) ...)
+(users/find '(= id ?) '(1))    ; => ((id . 1) (name . "Alice") ...)
+</enscript>
+
+=== Naming Conventions
+
+The ORM automatically converts between Scheme's kebab-case and SQL's snake_case:
+
+* Table name {{user-sessions}} maps to {{user_sessions}}
+* Column {{created-at}} maps to {{created_at}}
+* Query results are returned with kebab-case keys
+
+=== Data Representations
+
+* '''Query results''': a vector of alists, one alist per row
+* '''Single row''': an alist with symbol keys
+* '''SQL NULL''': represented as the symbol {{null}}
+* '''Metadata columns''': a TEXT column storing an s-expression alist, read/written via {{row-metadata}} / {{row-metadata-set!}}
+
+=== API: Database Layer (orm-db)
+
+The {{orm-db}} module defines a backend-agnostic interface using CHICKEN parameters. A backend is an alist mapping the symbols {{connect}}, {{close}}, {{query}}, and {{execute}} to procedures; the backend eggs provide constructors ({{sqlite3-backend}}, {{rqlite-backend}}) that return such an alist.
+
+<parameter>(db/backend [backend])</parameter>
+
+Get or set the current backend alist. Must be set before connecting.
+
+<parameter>(db/path [path])</parameter>
+
+Get or set the database path or connection string. Must be set before connecting.
+
+<parameter>(db/connection [conn])</parameter>
+
+Get or set the current (opaque, backend-specific) connection. Normally managed by {{db/connect}} / {{db/close}}.
+
+<procedure>(db/connect)</procedure>
+
+Open a connection using the current backend and path. Errors if either is unset.
+
+<enscript highlight="scheme">
+(db/backend (sqlite3-backend))
+(db/path "myapp.db")
+(db/connect)
+</enscript>
+
+<procedure>(db/close)</procedure>
+
+Close the current connection (no-op if none is open).
+
+<procedure>(db/query ssql-or-string [params])</procedure>
+
+Run a SELECT. {{ssql-or-string}} is either a raw SQL string or an {{ssql}} S-expression form; {{params}} is a list bound to {{?}} placeholders. Returns a vector of alists.
+
+<procedure>(db/execute ssql-or-string [params] [out-key])</procedure>
+
+Run an INSERT/UPDATE/DELETE/DDL statement. {{out-key}} selects which value the backend returns (default {{rows_affected}}; e.g. {{last_insert_rowid}}).
+
+=== API: Models (define-model)
+
+<syntax>(define-model name)</syntax>
+
+Defines a model bound to the existing table {{name}}. The macro introspects the table schema at runtime (via {{PRAGMA table_info}}) and generates the following functions. A live connection must exist when the generated functions are first called.
+
+<enscript highlight="scheme">
+(define-model users)
+</enscript>
+
+For a model named {{users}}, the generated functions are listed below. Each example shows the SQL that is produced (the SQLite dialect; rqlite renders identically). Assume {{users}} has columns {{id}}, {{name}}, {{email}}.
+
+<procedure>(users/all #!key limit order offset)</procedure>
+
+Return all rows as a vector of alists.
+
+<enscript highlight="scheme">
+(users/all)
+;; SQL: SELECT id, name, email FROM users
+
+(users/all limit: 10)
+;; SQL: SELECT id, name, email FROM users LIMIT 10
+
+(users/all order: 'name)               ; ascending
+;; SQL: SELECT id, name, email FROM users ORDER BY name
+
+(users/all order: '(desc created-at))  ; descending
+;; SQL: SELECT id, name, email FROM users ORDER BY created_at DESC
+</enscript>
+
+Note how the column list comes from the introspected schema, and kebab-case names in {{order}} are converted to snake_case.
+
+<procedure>(users/find [conditions] [values] #!key order)</procedure>
+
+Return a single row (alist) matching {{conditions}}, or {{#f}} if none. {{conditions}} is an {{ssql}} WHERE form with {{?}} placeholders, {{values}} the bound values.
+
+<enscript highlight="scheme">
+(users/find '(= id ?) '(1))
+;; SQL: SELECT id, name, email FROM users WHERE (id = ?) LIMIT 1
+
+(users/find '(= email ?) '("bob@example.com"))
+;; SQL: SELECT id, name, email FROM users WHERE (email = ?) LIMIT 1
+
+(users/find '(= id ?) '(999))   ; => #f
+</enscript>
+
+{{find}} is just {{where}} with {{limit: 1}}, returning the single row or {{#f}}.
+
+<procedure>(users/where [conditions] [values] #!key limit order offset)</procedure>
+
+Return all rows matching {{conditions}} as a vector of alists.
+
+<enscript highlight="scheme">
+(users/where '(= status ?) '("active"))
+;; SQL: SELECT id, name, email, status FROM users WHERE (status = ?)
+
+(users/where '(and (= status ?) (> age ?)) '("active" 18))
+;; SQL: SELECT ... FROM users WHERE ((status = ?) AND (age > ?))
+
+(users/where '(>= age ?) '(21))
+;; SQL: SELECT ... FROM users WHERE (age >= ?)
+
+(users/where '(like name ?) '("%alice%"))
+;; SQL: SELECT ... FROM users WHERE (name LIKE ?)
+
+(users/where '(is deleted-at ?) '(null))
+;; SQL: SELECT ... FROM users WHERE (deleted_at IS ?)
+
+(users/where '(= status ?) '("active") limit: 10 order: '(desc created-at))
+;; SQL: SELECT ... FROM users WHERE (status = ?) ORDER BY created_at DESC LIMIT 10
+</enscript>
+
+Comparison operators: {{=}}, {{<>}}, {{<}}, {{>}}, {{<=}}, {{>=}}, {{like}}, {{is}}. The {{conditions}} form is an {{ssql}} expression; {{?}} placeholders are bound positionally from {{values}}.
+
+<procedure>(users/count [conditions] [values])</procedure>
+
+Return the number of matching rows (all rows if no conditions).
+
+<enscript highlight="scheme">
+(users/count)                       ; => 42
+;; SQL: SELECT COUNT(*) AS _count FROM users
+
+(users/count '(= status ?) '("active"))  ; => 15
+;; SQL: SELECT COUNT(*) AS _count FROM users WHERE (status = ?)
+</enscript>
+
+<procedure>(users/create row-alist)</procedure>
+
+Insert a new row and return it (re-fetched by rowid).
+
+<enscript highlight="scheme">
+(users/create '((name . "Charlie") (email . "charlie@example.com")))
+; => ((id . 3) (name . "Charlie") ...)
+;; SQL: INSERT INTO users (name, email) VALUES (?, ?)
+;;      then re-fetched: SELECT ... FROM users WHERE (rowid = ?) LIMIT 1
+</enscript>
+
+Pairs whose value is {{'()}} are dropped, so only supplied columns are inserted.
+
+<procedure>(users/save row-alist)</procedure>
+
+Update an existing row, matched by primary key, and return the fresh row. Sets {{updated_at}} to {{CURRENT_TIMESTAMP}} and ignores {{created-at}} / {{updated-at}} in the input.
+
+<enscript highlight="scheme">
+(let* ((user (users/find '(= id ?) '(1)))
+       (updated (alist-update 'name "Alicia" user)))
+  (users/save updated))
+;; SQL: UPDATE users SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE (id = ?)
+;;      then re-fetched: SELECT ... FROM users WHERE (id = ?) LIMIT 1
+</enscript>
+
+Only non-primary-key, non-timestamp columns appear in the {{SET}} list; {{updated_at}} is always set to {{CURRENT_TIMESTAMP}}.
+
+<procedure>(users/update id updates)</procedure>
+
+Convenience wrapper: find the row by {{id}}, apply the {{updates}} alist, and save. Returns the updated row, or {{#f}} if the id is not found.
+
+<enscript highlight="scheme">
+(users/update 1 '((name . "Alicia") (status . "inactive")))
+(users/update 999 '((name . "Nobody")))   ; => #f
+</enscript>
+
+<procedure>(users/delete row-alist)</procedure>
+
+Delete the row identified by the primary key in {{row-alist}}. Returns {{#t}}.
+
+<enscript highlight="scheme">
+(let ((user (users/find '(= id ?) '(1))))
+  (users/delete user))
+;; SQL: DELETE FROM users WHERE (id = ?)
+</enscript>
+
+<procedure>(users/columns)</procedure>
+
+Return the table's column metadata.
+
+<procedure>(users/pkey)</procedure>
+
+Return the primary key column name(s) as a list.
+
+=== API: Relationships (model/has-many)
+
+<syntax>(model/has-many parent child)</syntax>
+
+Declare a has-many relationship between two existing models. Assumes the convention that the child table has a {{<singular-parent>-id}} foreign key column (e.g. {{posts.user_id}} → {{users.id}}).
+
+<enscript highlight="scheme">
+(define-model users)
+(define-model posts)
+(model/has-many users posts)   ; posts.user_id -> users.id
+</enscript>
+
+This generates three functions:
+
+<procedure>(users/posts parent-row [conditions] [values] #!key limit order offset)</procedure>
+
+Return all child rows belonging to {{parent-row}}, optionally further filtered.
+
+<enscript highlight="scheme">
+(let ((user (users/find '(= id ?) '(1))))
+  (users/posts user))
+;; SQL: SELECT id, user_id, title FROM posts WHERE (user_id = ?)
+
+;; with extra conditions
+(let ((user (users/find '(= id ?) '(1))))
+  (users/posts user '(= published ?) '(#t)))
+;; SQL: SELECT ... FROM posts WHERE ((user_id = ?) AND (published = ?))
+</enscript>
+
+<procedure>(posts/users child-row)</procedure>
+
+Return the parent row for {{child-row}}.
+
+<enscript highlight="scheme">
+(let ((post (posts/find '(= id ?) '(1))))
+  (posts/users post))   ; => ((id . 1) (name . "Alice") ...)
+;; SQL: SELECT id, name, email FROM users WHERE (id = ?) LIMIT 1
+</enscript>
+
+<procedure>(users/add-posts parent-row child-row)</procedure>
+
+Associate {{child-row}} with {{parent-row}} by setting the foreign key, and save the child (issuing the same {{UPDATE posts SET ... WHERE (id = ?)}} as {{posts/save}}).
+
+=== API: Migrations
+
+A migration registers an up procedure and a down procedure under a name. Migrations are applied in registration order; the current version is tracked in a {{schema_migrations}} table that is created automatically.
+
+<procedure>(model/migration name up-proc down-proc)</procedure>
+
+Register a migration. {{name}} is a string (e.g. {{"001-create-users"}}); {{up-proc}} and {{down-proc}} are zero-argument thunks.
+
+<enscript highlight="scheme">
+(model/migration "001-create-users"
+  (lambda ()
+    (model/schema/create-table 'users
+      '(id integer (primary-key #t) (autoincrement #t))
+      '(name text (not-null #t))
+      '(email text (unique #t))
+      '(created-at datetime (default CURRENT_TIMESTAMP))
+      '(updated-at datetime (default CURRENT_TIMESTAMP))))
+  (lambda ()
+    (model/schema/drop-table 'users)))
+
+(model/migration "002-add-status-to-users"
+  (lambda () (model/schema/add-columns 'users '(status text (default "active"))))
+  (lambda () (model/schema/drop-columns 'users 'status)))
+</enscript>
+
+<procedure>(model/migrate [target-version])</procedure>
+
+Apply migrations. With no argument, migrate up to the latest registered migration. With a target name, migrate up '''or''' down to that version, applying the necessary up/down procedures in order.
+
+<enscript highlight="scheme">
+(model/migrate)                    ; up to latest
+(model/migrate "001-create-users") ; up or down to this version
+</enscript>
+
+<procedure>(model/rollback-all!)</procedure>
+
+Roll back every applied migration, returning the schema to a clean state.
+
+==== Running Migrations from the CLI
+
+The egg installs an {{orm-migrate}} program that runs migrations without a driver script. Point it at a migrations file — a plain Scheme file containing {{(model/migration ...)}} forms (no imports needed; {{orm}} is already in scope) — and choose the backend at runtime.
+
+<enscript highlight="bash">
+# Apply all migrations up to the latest
+orm-migrate -b sqlite -path myapp.db -f migrations.scm
+
+# Migrate up or down to a specific version
+orm-migrate -b sqlite -path myapp.db -f migrations.scm -m 001-create-users
+
+# Roll everything back to a clean state
+orm-migrate -b sqlite -path myapp.db -f migrations.scm --rollback
+
+# rqlite: -path is the HTTP connection string (keep credentials off disk)
+orm-migrate -b rqlite -path "https://user:pass@host:4001" -f migrations.scm
+</enscript>
+
+Flags:
+
+* {{-b}}, {{--backend}} — backend to use: {{sqlite}} or {{rqlite}} (required)
+* {{-path}}, {{--path}} — database path / connection string (required)
+* {{-f}}, {{--file}} — migrations file with {{(model/migration ...)}} forms (required)
+* {{-m}}, {{--migration}} — target version; migrates up or down to it (default: latest)
+* {{--rollback}} — roll back all migrations
+* {{-h}}, {{--help}} — show usage
+
+The chosen backend egg ({{orm-db-sqlite}} or {{orm-db-rqlite}}) is imported dynamically at runtime, so it must be installed, but the {{orm}} egg keeps no static dependency on either.
+
+=== API: Schema Helpers
+
+These helpers generate and run DDL; they are normally called from inside migration thunks.
+
+<procedure>(model/schema/create-table table-name column-spec ...)</procedure>
+
+Create a table. Each {{column-spec}} is {{(name type option ...)}}.
+
+<enscript highlight="scheme">
+(model/schema/create-table 'posts
+  '(id integer (primary-key #t) (autoincrement #t))
+  '(user-id integer (foreign-key users id))
+  '(title text (not-null #t))
+  '(body text)
+  '(published boolean (default #f))
+  '(created-at datetime (default CURRENT_TIMESTAMP)))
+</enscript>
+
+<procedure>(model/schema/drop-table table-name)</procedure>
+
+Drop a table.
+
+<procedure>(model/schema/add-columns table-name column-spec ...)</procedure>
+
+Add one or more columns. Honors the same options as {{create-table}}.
+
+<enscript highlight="scheme">
+(model/schema/add-columns 'posts
+  '(slug text)
+  '(view-count integer (default 0)))
+</enscript>
+
+<procedure>(model/schema/drop-columns table-name column-name ...)</procedure>
+
+Drop one or more columns (subject to the backend's {{ALTER TABLE}} support).
+
+<procedure>(column-spec->sql spec [alter?])</procedure>
+
+Render a single column spec to its SQL fragment. Exposed for reuse; {{create-table}} and {{add-columns}} build on it.
+
+==== Column Options
+
+| {{primary-key}} | {{(primary-key #t)}} | Mark as primary key |
+| {{autoincrement}} | {{(autoincrement #t)}} | Auto-increment (integers) |
+| {{not-null}} | {{(not-null #t)}} | NOT NULL constraint |
+| {{unique}} | {{(unique #t)}} | UNIQUE constraint |
+| {{default}} | {{(default 0)}} | Default value |
+| {{foreign-key}} | {{(foreign-key users id)}} | Foreign key reference |
+
+==== Column Types
+
+Supported types: {{integer}}, {{text}}, {{string}}, {{real}}, {{float}}, {{blob}}, {{datetime}}, {{boolean}}.
+
+=== API: Helper Functions
+
+<procedure>(row-ref/default key row [default])</procedure>
+
+Read {{key}} from {{row}}, returning {{default}} when the value is SQL NULL (the symbol {{null}}). Signals an error if the key is absent. {{default}} is {{#f}} when omitted.
+
+<enscript highlight="scheme">
+(row-ref/default 'name user)            ; => "Alice"
+(row-ref/default 'nickname user "N/A")  ; => "N/A" if NULL
+</enscript>
+
+<procedure>(row-metadata row [default])</procedure>
+
+For a row with a {{metadata}} TEXT column holding an s-expression alist, parse and return that alist (or {{default}}, default {{'()}}, when NULL or unparseable).
+
+<enscript highlight="scheme">
+(row-metadata user)   ; => ((theme . "dark") (language . "en"))
+</enscript>
+
+<procedure>(row-metadata-set! row alist)</procedure>
+
+Write {{alist}} to the row's {{metadata}} column and return the updated row alist.
+
+<enscript highlight="scheme">
+(row-metadata-set! user '((theme . "light")))
+</enscript>
+
+<procedure>(symbol->db-column sym)</procedure>
+<procedure>(db-column->symbol sym-or-string)</procedure>
+
+Convert names between Scheme kebab-case and SQL snake_case.
+
+<enscript highlight="scheme">
+(symbol->db-column 'created-at)   ; => created_at
+(db-column->symbol 'created_at)   ; => created-at
+(db-column->symbol "created_at")  ; => created-at
+</enscript>
+
+The module also exports the lower-level helpers {{load-table-metadata}}, {{register-model!}}, {{get-model-metadata}}, {{convert-result-keys}}, {{convert-results-vector}}, {{get-primary-key-columns}}, {{build-pk-where}}, and {{map-field-names->columns}}, used internally by the generated functions.
+
+=== API: Testing (orm-test)
+
+The {{orm-test}} module — bundled in the {{orm}} egg, no separate install — provides a mock backend for testing code that uses {{orm-db}} without a real database.
+
+<procedure>(make-mock-backend)</procedure>
+
+Returns two values: a backend alist (compatible with {{db/backend}}) and a {{spy}} procedure for inspecting and controlling the mock.
+
+<enscript highlight="scheme">
+(import orm-db orm-test)
+
+(receive (backend spy) (make-mock-backend)
+  (db/backend backend)
+  (db/path "ignored")
+  (db/connect)
+
+  ;; Configure responses
+  (spy 'on-query (list (vector '((id . 1) (name . "Alice")))))
+
+  (users/all)        ; => #(((id . 1) (name . "Alice")))
+  (spy 'queries))    ; => (("SELECT ..." ()))
+</enscript>
+
+The {{spy}} procedure responds to these messages:
+
+* {{(spy 'queries)}} — list of {{(sql params)}} pairs from all queries
+* {{(spy 'executions)}} — list of {{(sql params out-key)}} from all executions
+* {{(spy 'on-query responses-or-proc)}} — set query responses: a list (consumed in order, last item repeats) or a {{(lambda (sql params) ...)}}
+* {{(spy 'on-execute responses-or-proc)}} — set execute responses: a list or a {{(lambda (sql params out-key) ...)}}
+* {{(spy 'reset!)}} — clear recorded queries and executions
+
+<enscript highlight="scheme">
+;; Static list of responses (last item repeats forever)
+(spy 'on-query (list
+  (vector '((id . 1) (name . "Alice")))   ; first query
+  (vector)))                               ; all subsequent queries
+
+;; Dynamic responses
+(spy 'on-query (lambda (sql params)
+  (if (string-contains sql "users")
+      (vector '((id . 1) (name . "Alice")))
+      (vector))))
+</enscript>
+
+=== Complete Example
+
+<enscript highlight="scheme">
+(import orm-db orm-db-sqlite orm)
+
+;; 1. Connect
+(db/backend (sqlite3-backend))
+(db/path "blog.db")
+(db/connect)
+
+;; 2. Migrate the schema
+(model/migration "001-init"
+  (lambda ()
+    (model/schema/create-table 'users
+      '(id integer (primary-key #t) (autoincrement #t))
+      '(name text (not-null #t))
+      '(updated-at datetime (default CURRENT_TIMESTAMP)))
+    (model/schema/create-table 'posts
+      '(id integer (primary-key #t) (autoincrement #t))
+      '(user-id integer (foreign-key users id))
+      '(title text (not-null #t))
+      '(updated-at datetime (default CURRENT_TIMESTAMP))))
+  (lambda ()
+    (model/schema/drop-table 'posts)
+    (model/schema/drop-table 'users)))
+
+(model/migrate)
+
+;; 3. Define models and a relationship
+(define-model users)
+(define-model posts)
+(model/has-many users posts)
+
+;; 4. Use them
+(define alice (users/create '((name . "Alice"))))
+(users/add-posts alice (posts/create `((title . "Hello") (user-id . ,(alist-ref 'id alice)))))
+
+(users/posts alice)   ; => #(((id . 1) (title . "Hello") ...))
+
+(db/close)
+</enscript>
+
+=== License
+
+Copyright © 2026 Rolando Abarca. Released under the BSD-3-Clause license.
+
+=== Repository
+
+Part of the [[https://github.com/schematra/chicken-orm-egg|chicken-orm-egg]] project.
