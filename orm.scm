@@ -11,6 +11,10 @@
  get-primary-key-columns
  build-pk-where
  map-field-names->columns
+ make-model-scope
+ model-scope?
+ apply-model-scope-condition
+ apply-model-scope-write
  define-model
  model/has-many
  model/migration
@@ -54,6 +58,54 @@
 
 ;; Global registry for model metadata
 (define *model-registry* '())
+
+;; Optional, application-defined policy attached to a model. The ORM knows
+;; nothing about tenants (or any other policy): it only asks for a mandatory
+;; query condition and lets the application prepare rows before writes.
+(define-record-type model-scope
+  (%make-model-scope condition-procedure write-procedure)
+  model-scope?
+  (condition-procedure model-scope-condition-procedure)
+  (write-procedure model-scope-write-procedure))
+
+(define (make-model-scope condition-procedure
+                          #!optional (write-procedure (lambda (row) row)))
+  (unless (procedure? condition-procedure)
+    (error "model scope condition must be a procedure" condition-procedure))
+  (unless (procedure? write-procedure)
+    (error "model scope write preparation must be a procedure" write-procedure))
+  (%make-model-scope condition-procedure write-procedure))
+
+;; Combine the scope before the caller condition so placeholder values have a
+;; deterministic order. A configured scope may never return #f: that would
+;; silently turn a fail-closed model into an unscoped query.
+(define (apply-model-scope-condition scope conditions query-values)
+  (if (not scope)
+      (values conditions query-values)
+      (begin
+        (unless (model-scope? scope)
+          (error "invalid model scope" scope))
+        (let-values (((scope-condition scope-values)
+                      ((model-scope-condition-procedure scope))))
+          (unless scope-condition
+            (error "model scope condition procedure returned no condition"))
+          (unless (list? scope-values)
+            (error "model scope condition values must be a list" scope-values))
+          (values (if conditions
+                      `(and ,scope-condition ,conditions)
+                      scope-condition)
+                  (append scope-values query-values))))))
+
+(define (apply-model-scope-write scope row)
+  (if (not scope)
+      row
+      (begin
+        (unless (model-scope? scope)
+          (error "invalid model scope" scope))
+        (let ((prepared ((model-scope-write-procedure scope) row)))
+          (unless (list? prepared)
+            (error "model scope write procedure must return a row alist" prepared))
+          prepared))))
 
 ;; Model metadata management
 (define (register-model! name metadata)
@@ -182,6 +234,15 @@
   (er-macro-transformer
    (lambda (x r c)
      (let* ((table-name (cadr x))
+            (options (cddr x))
+            (scope-expression
+             (cond
+              ((null? options) #f)
+              ((and (= (length options) 2)
+                    (eq? (car options) 'scope:))
+               (cadr options))
+              (else
+               (error "define-model expects (define-model name [scope: scope])" x))))
             (table-name-str (symbol->string table-name))
             ;; Generate function names
             (load-metadata-name (string->symbol (conc table-name-str "/load-metadata")))
@@ -195,6 +256,7 @@
             (save-name (string->symbol (conc table-name-str "/save")))
             (update-name (string->symbol (conc table-name-str "/update")))
             (delete-name (string->symbol (conc table-name-str "/delete")))
+	    (scope-name (string->symbol (conc table-name-str "/%scope")))
 	    ;; sanitized versions
 	    (%let (r 'let))
 	    (%let* (r 'let*))
@@ -207,6 +269,10 @@
          ;; Export all generated functions (must be at module toplevel)
          (,(r 'export) ,load-metadata-name ,columns-name ,pkey-name
           ,where-name ,all-name ,find-name ,count-name ,create-name ,save-name ,update-name ,delete-name)
+
+         ;; Scope policy is private to the model's module. #f preserves the
+         ;; historical behavior for every existing define-model call.
+         (,%define ,scope-name ,scope-expression)
 
          ;; Load metadata function
          (,%define (,load-metadata-name)
@@ -225,6 +291,8 @@
 
          ;; Where function - returns vector of alists
          (,%define (,where-name #!optional conditions (values '()) #!key (limit #f) (order #f) (offset #f))
+                   (,(r 'let-values) (((scoped-conditions scoped-values)
+                                       (apply-model-scope-condition ,scope-name conditions values)))
                    (,%let* ((columns (,%map ,%car (,columns-name)))
                             (db-columns (,%map (,(r 'lambda) (col-spec)
                                                 (symbol->db-column col-spec)) columns))
@@ -246,11 +314,11 @@
                                        #f))
                             (query-parts `(select (columns ,@db-columns)
                                             (from ,db-table-name)
-                                            ,@(,(r 'if) conditions `((where ,(map-field-names->columns conditions columns))) '())
+                                            ,@(,(r 'if) scoped-conditions `((where ,(map-field-names->columns scoped-conditions columns))) '())
                                             ,@(,(r 'if) converted-order `((order ,converted-order)) '())
                                             ,@(,(r 'if) limit `((limit ,limit)) '())
                                             ,@(,(r 'if) offset `((offset ,offset)) '()))))
-                           (convert-results-vector (db/query query-parts values))))
+                           (convert-results-vector (db/query query-parts scoped-values)))))
 
          ;; Convenience "all" search
          (,%define (,all-name #!key (limit #f) (order #f) (offset #f))
@@ -265,26 +333,29 @@
 
          ;; Count function - returns integer count of matching rows
          (,%define (,count-name #!optional conditions (values '()))
+                   (,(r 'let-values) (((scoped-conditions scoped-values)
+                                       (apply-model-scope-condition ,scope-name conditions values)))
                    (,%let* ((columns (,columns-name))
                             (db-columns (,%map (,(r 'lambda) (col-spec)
                                                 (symbol->db-column col-spec)) (,%map ,%car columns)))
                             (db-table-name (symbol->db-column ',table-name))
                             (query-parts `(select (columns (as (count *) _count))
                                             (from ,db-table-name)
-                                            ,@(,(r 'if) conditions `((where ,(map-field-names->columns conditions (,%map ,%car columns)))) '())))
-                            (result (db/query query-parts values)))
+                                            ,@(,(r 'if) scoped-conditions `((where ,(map-field-names->columns scoped-conditions (,%map ,%car columns)))) '())))
+                            (result (db/query query-parts scoped-values)))
                            ;; Safely extract count - handle empty result or errors
                            (,%if (,(r 'and) result (,(r 'vector?) result) (,(r 'eq?) (,(r 'vector-length) result) 1))
                                  (,(r 'alist-ref) '_count (,(r 'vector-ref) result 0))
-                                 0)))
+                                 0))))
 
          ;; Create function - takes alist, returns alist of created row
          (,%define (,create-name row-alist)
-		   (,%let* ((columns (,columns-name))
+		   (,%let* ((prepared-row (apply-model-scope-write ,scope-name row-alist))
+			    (columns (,columns-name))
 			    (db-columns (,%map (,(r 'lambda) (col-spec)
 						(symbol->db-column (,%car col-spec))) columns))
 			    (filtered-alist (,(r 'filter) (,(r 'lambda) (pair)
-							   (,(r 'not) (,(r 'null?) (,(r 'cdr) pair)))) row-alist))
+							   (,(r 'not) (,(r 'null?) (,(r 'cdr) pair)))) prepared-row))
 			    (insert-columns (,%map (,(r 'lambda) (pair) (symbol->db-column (,(r 'car) pair))) filtered-alist))
 			    (values (,%map ,(r 'cdr) filtered-alist))
 			    (placeholders (,(r 'make-list) (,(r 'length) values) '?))
@@ -298,10 +369,13 @@
 
          ;; Save function - takes alist, updates existing row
          (,%define (,save-name row-alist)
-	           (,%let* ((columns (,columns-name))
+	           (,%let* ((prepared-row (apply-model-scope-write ,scope-name row-alist))
+		            (columns (,columns-name))
 		            (pk-columns (get-primary-key-columns columns)))
 	                   (,(r 'let-values) (((pk-where pk-values)
-			                       (build-pk-where pk-columns row-alist)))
+			                       (build-pk-where pk-columns prepared-row)))
+	                    (,(r 'let-values) (((scoped-where scoped-values)
+			                         (apply-model-scope-condition ,scope-name pk-where pk-values)))
 	                    (,%let* ((non-pk-pairs (,(r 'filter) (,(r 'lambda) (pair)
 						                  (,%let ((col-name (,(r 'car) pair)))
 							                 (,(r 'and)
@@ -311,19 +385,19 @@
 								                      pk-columns))
 							                  ;; Not a timestamp column (updated_at, created_at)
 							                  (,(r 'not) (,(r 'memq) col-name '(updated-at created-at))))))
-                                                    row-alist))
+                                                    prepared-row))
 		                     (set-clauses (,%map (,(r 'lambda) (pair)
 						          `(,(symbol->db-column (,(r 'car) pair)) ?))
 					                 non-pk-pairs))
 		                     (set-values (,%map ,(r 'cdr) non-pk-pairs))
-		                     (all-values (,(r 'append) set-values pk-values))
+		                     (all-values (,(r 'append) set-values scoped-values))
 		                     (db-table-name (symbol->db-column ',table-name))
 		                     (query `(update ,db-table-name
 				                     (set ,@set-clauses (updated_at CURRENT_TIMESTAMP))
-				                     (where ,pk-where))))
+				                     (where ,(map-field-names->columns scoped-where (,%map ,%car columns))))))
 		                    (db/execute query all-values)
                                     ;; return a fresh version, because some fields might update on save
-                                    (,find-name '(= id ?) (list (alist-ref 'id row-alist)))))))
+                                    (,find-name '(= id ?) (list (alist-ref 'id prepared-row))))))))
 
          ;; update function, wrapper around find -> save
          (,%define (,update-name id updates)
@@ -341,10 +415,14 @@
 				       (,%let* ((columns (,columns-name))
 						(pk-columns (get-primary-key-columns columns)))
 					       (build-pk-where pk-columns row-alist))))
-		    (,%let* ((db-table-name (symbol->db-column ',table-name))
-			     (query `(delete (from ,db-table-name) (where ,pk-where))))
-			    (db/execute query pk-values)
-			    #t)))
+		    (,(r 'let-values) (((scoped-where scoped-values)
+			                 (apply-model-scope-condition ,scope-name pk-where pk-values)))
+		    (,%let* ((columns (,%map ,%car (,columns-name)))
+			     (db-table-name (symbol->db-column ',table-name))
+			     (query `(delete (from ,db-table-name)
+			                    (where ,(map-field-names->columns scoped-where columns)))))
+			    (db/execute query scoped-values)
+			    #t))))
 	 ;; load metadata
 	 (,load-metadata-name))))))
 

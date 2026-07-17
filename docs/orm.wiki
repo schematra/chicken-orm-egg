@@ -104,13 +104,34 @@ Run an INSERT/UPDATE/DELETE/DDL statement. {{out-key}} selects which value the b
 
 === API: Models (define-model)
 
-<syntax>(define-model name)</syntax>
+<syntax>(define-model name [scope: model-scope])</syntax>
 
 Defines a model bound to the existing table {{name}}. The macro introspects the table schema at runtime (via {{PRAGMA table_info}}) and generates the following functions. A live connection must exist when the generated functions are first called.
 
 <enscript highlight="scheme">
 (define-model users)
 </enscript>
+
+An optional model scope supplies a mandatory query condition and a row preparation callback:
+
+<enscript highlight="scheme">
+(define current-account-id (make-parameter #f))
+
+(define account-scope
+  (make-model-scope
+   (lambda ()
+     (let ((account-id (current-account-id)))
+       (unless account-id (error "account scope required"))
+       (values '(= account-id ?) (list account-id))))
+   (lambda (row)
+     (alist-update 'account-id (current-account-id) row))))
+
+(define-model invoices scope: account-scope)
+</enscript>
+
+The condition callback takes no arguments and returns two values: an {{ssql}} condition and its placeholder-value list. The ORM places this condition before any caller condition for {{all}}, {{find}}, {{where}}, and {{count}}, and includes it in the same SQL {{WHERE}} for {{save}}, {{update}}, and {{delete}}. This makes scoped writes atomic rather than a check followed by an unscoped primary-key mutation.
+
+The optional write callback receives and returns a row alist. It runs before {{create}} and {{save}}; {{update}} delegates to scoped {{find}} and {{save}}. If omitted, it defaults to the identity function. Scope callbacks should signal an error when required context is unavailable. A configured scope that returns {{#f}} as its condition is rejected. Raw {{db/query}} and {{db/execute}} calls bypass model scopes.
 
 For a model named {{users}}, the generated functions are listed below. Each example shows the SQL that is produced (the SQLite dialect; rqlite renders identically). Assume {{users}} has columns {{id}}, {{name}}, {{email}}.
 

@@ -88,6 +88,39 @@ This generates the following functions:
 | `users/columns` | Get column metadata |
 | `users/pkey` | Get primary key column(s) |
 
+### Mandatory Model Scopes
+
+A model may declare an application-defined scope that the ORM automatically
+applies to every generated CRUD operation:
+
+```scheme
+(define current-account-id (make-parameter #f))
+
+(define account-scope
+  (make-model-scope
+   ;; Return a mandatory condition and its placeholder values.
+   (lambda ()
+     (let ((account-id (current-account-id)))
+       (unless account-id (error "account scope required"))
+       (values '(= account-id ?) (list account-id))))
+   ;; Prepare rows before create/save (update delegates to save).
+   (lambda (row)
+     (alist-update 'account-id (current-account-id) row))))
+
+(define-model invoices scope: account-scope)
+```
+
+The scope condition is combined before caller conditions for `all`, `find`,
+`where`, and `count`. It is also included directly in the `WHERE` clause for
+`save`, `update`, and `delete`, so a primary key from another scope cannot be
+modified. The write callback runs before `create` and `save`, allowing the
+application to stamp or validate ownership fields.
+
+Scope callbacks should fail when required context is missing. A configured
+scope that returns no condition is rejected rather than falling back to an
+unscoped query. Direct `db/query` and `db/execute` calls bypass model scopes and
+remain the application's responsibility.
+
 ### Naming Conventions
 
 The ORM automatically converts between Scheme's kebab-case and SQL's snake_case:
@@ -442,6 +475,22 @@ Responses can be a list (each call consumes the next item; the last item repeats
       (vector '((id . 1) (name . "Alice")))
       (vector))))
 ```
+
+## History
+
+### v0.0.11
+
+- Added mandatory model scopes: `(define-model name scope: my-scope)` attaches an
+  application-defined policy that the ORM applies to every generated CRUD function.
+- New exports: `make-model-scope`, `model-scope?`, `apply-model-scope-condition`,
+  `apply-model-scope-write`.
+- The scope condition is combined into the same `WHERE` clause used by `save`,
+  `update`, and `delete`, so a primary key from another scope cannot be mutated.
+- The optional write callback runs before `create` and `save`, letting the
+  application stamp or validate ownership fields.
+- A configured scope that returns no condition is rejected rather than silently
+  falling back to an unscoped query.
+- Models without `scope:` are unchanged.
 
 ## License
 

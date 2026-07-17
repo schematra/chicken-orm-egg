@@ -124,6 +124,26 @@
   ;; Define a model for the test table
   (define-model users)
 
+  ;; A generic mandatory model scope. "account" is intentionally used here to
+  ;; keep the ORM feature independent from any tenant/agency convention.
+  (db/execute "CREATE TABLE scoped_records (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, name TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+
+  (define current-account-id (make-parameter #f))
+  (define account-scope
+    (make-model-scope
+     (lambda ()
+       (let ((account-id (current-account-id)))
+         (unless account-id
+           (error "account scope required"))
+         (values '(= account-id ?) (list account-id))))
+     (lambda (row)
+       (let ((account-id (current-account-id)))
+         (unless account-id
+           (error "account scope required"))
+         (alist-update 'account-id account-id row)))))
+
+  (define-model scoped-records scope: account-scope)
+
   (test-group "define-model generated functions"
     (test-group "columns and metadata"
       (test-assert "users/columns returns a list"
@@ -181,6 +201,93 @@
           (users/delete alice))
         (test "count after delete"
           1 (users/count)))))
+
+  (test-group "model scopes"
+    (db/execute "DELETE FROM scoped_records")
+
+    (test-error "missing scope context fails closed"
+      (scoped-records/all))
+
+    (let* ((account-1-row
+            (parameterize ((current-account-id 1))
+              (scoped-records/create '((name . "Account 1")))))
+           (account-2-row
+            (parameterize ((current-account-id 2))
+              (scoped-records/create
+               '((account-id . 1) (name . "Account 2"))))))
+
+      (test "create applies the scope write preparation"
+        2 (alist-ref 'account-id account-2-row))
+
+      (parameterize ((current-account-id 1))
+        (test "all is scoped"
+          '("Account 1")
+          (map (lambda (row) (alist-ref 'name row))
+               (vector->list (scoped-records/all))))
+
+        (test "where combines scope and caller conditions"
+          1
+          (vector-length
+           (scoped-records/where '(= name ?) '("Account 1"))))
+
+        (test "find cannot load another scope by primary key"
+          #f
+          (scoped-records/find '(= id ?) (list (alist-ref 'id account-2-row))))
+
+        (test "count is scoped"
+          1 (scoped-records/count))
+
+        (test "count combines scope and caller conditions"
+          0 (scoped-records/count '(= name ?) '("Account 2")))
+
+        (test "save is atomically scoped"
+          #f
+          (scoped-records/save
+           (alist-update
+            'account-id 1
+            (alist-update 'name "Cross-scope update" account-2-row))))
+
+        (test "update cannot find another scoped row"
+          #f
+          (scoped-records/update
+           (alist-ref 'id account-2-row)
+           '((name . "Cross-scope update"))))
+
+        (test-assert "delete preserves its historical return value"
+          (scoped-records/delete account-2-row))
+
+        (test "cross-scope writes leave the other row unchanged"
+          "Account 2"
+          (alist-ref
+           'name
+           (vector-ref
+            (db/query "SELECT * FROM scoped_records WHERE id = ?"
+                      (list (alist-ref 'id account-2-row)))
+            0)))
+
+        (test "save keeps an owned row inside its scope"
+          1
+          (alist-ref
+           'account-id
+           (scoped-records/save
+            (alist-update
+             'account-id 2
+             (alist-update 'name "Updated" account-1-row)))))
+
+        (test "delete removes an owned row"
+          #t
+          (scoped-records/delete
+           (scoped-records/find
+            '(= id ?) (list (alist-ref 'id account-1-row)))))
+
+        (test "owned row is gone"
+          0 (scoped-records/count))))
+
+    (test-error "a scope may not silently return no condition"
+      (apply-model-scope-condition
+       (make-model-scope (lambda () (values #f '())))
+       #f
+       '())))
 
   ;; --- Migration tests ---
   (test-group "migrations"
