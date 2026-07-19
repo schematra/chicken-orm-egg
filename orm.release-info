@@ -1,2 +1,2 @@
 (uri targz "https://github.com/schematra/chicken-orm-egg/archive/refs/tags/v{egg-release}.tar.gz")
-(release "0.0.11")
+(release "0.0.12")

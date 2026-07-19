@@ -15,6 +15,16 @@
  model-scope?
  apply-model-scope-condition
  apply-model-scope-write
+ make-model-hooks
+ model-hooks?
+ model-hooks-add!
+ model-hooks-ref
+ model-hooks-clear!
+ model-hook-event?
+ model-hook-events
+ run-before-hooks
+ run-after-hooks
+ model/hook
  define-model
  model/has-many
  model/migration
@@ -106,6 +116,90 @@
           (unless (list? prepared)
             (error "model scope write procedure must return a row alist" prepared))
           prepared))))
+
+;; Lifecycle hooks. Unlike a model scope (one procedure, security boundary),
+;; hooks are additive and multi-subscriber: any module holding (<table>/hooks)
+;; can register ordinary application behavior. Hooks run *before* the scope's
+;; write procedure, so the scope always gets the last word on a row.
+(define *model-hook-events*
+  '(before-create after-create
+    before-save   after-save
+    before-delete after-delete))
+
+(define (model-hook-events) *model-hook-events*)
+
+(define (model-hook-event? event)
+  (and (memq event *model-hook-events*) #t))
+
+(define-record-type model-hooks
+  (%make-model-hooks alist)
+  model-hooks?
+  (alist model-hooks-alist model-hooks-alist-set!))
+
+(define (make-model-hooks) (%make-model-hooks '()))
+
+;; Appends, so registration order is run order.
+(define (model-hooks-add! hooks event proc)
+  (unless (model-hooks? hooks)
+    (error "invalid model hooks" hooks))
+  (unless (model-hook-event? event)
+    (error "unknown model hook event" event))
+  (unless (procedure? proc)
+    (error "model hook must be a procedure" proc))
+  (model-hooks-alist-set!
+   hooks
+   (alist-update event
+                 (append (or (alist-ref event (model-hooks-alist hooks)) '())
+                         (list proc))
+                 (model-hooks-alist hooks)))
+  proc)
+
+(define (model-hooks-ref hooks event)
+  (unless (model-hooks? hooks)
+    (error "invalid model hooks" hooks))
+  (or (alist-ref event (model-hooks-alist hooks)) '()))
+
+(define (model-hooks-clear! hooks #!optional event)
+  (unless (model-hooks? hooks)
+    (error "invalid model hooks" hooks))
+  (model-hooks-alist-set!
+   hooks
+   (if event
+       (alist-update event '() (model-hooks-alist hooks))
+       '())))
+
+;; before-* hooks are a left fold: row-alist -> row-alist, in registration
+;; order, each fed the previous one's output.
+(define (run-before-hooks hooks event row)
+  (if (not hooks)
+      row
+      (fold (lambda (proc acc)
+              (let ((result (proc acc)))
+                (unless (list? result)
+                  (error "model hook must return a row alist" result))
+                result))
+            row
+            (model-hooks-ref hooks event))))
+
+;; after-* hooks are observers: they see the persisted row and their return
+;; values are discarded. Folding them too would make one hook forgetting to
+;; return the row corrupt what create/save hand back.
+;;
+;; A #f row means the post-write re-fetch found nothing, which happens when the
+;; write landed outside the model's scope. After-hooks are skipped there; that
+;; is hard to debug silently, so it warns. The row is returned either way, so
+;; generated code can use this call as its tail expression. The warning has to
+;; live here: `w` belongs to orm's module, not to the model's.
+(define (run-after-hooks hooks event row)
+  (cond
+   ((not row)
+    (w "skipping " event " hooks: row not visible after write (out of scope?)")
+    row)
+   ((not hooks) row)
+   (else
+    (for-each (lambda (proc) (proc row))
+              (model-hooks-ref hooks event))
+    row)))
 
 ;; Model metadata management
 (define (register-model! name metadata)
@@ -257,6 +351,8 @@
             (update-name (string->symbol (conc table-name-str "/update")))
             (delete-name (string->symbol (conc table-name-str "/delete")))
 	    (scope-name (string->symbol (conc table-name-str "/%scope")))
+	    (hooks-name (string->symbol (conc table-name-str "/hooks")))
+	    (hooks-var-name (string->symbol (conc table-name-str "/%hooks")))
 	    ;; sanitized versions
 	    (%let (r 'let))
 	    (%let* (r 'let*))
@@ -268,11 +364,17 @@
        `(,(r 'begin)
          ;; Export all generated functions (must be at module toplevel)
          (,(r 'export) ,load-metadata-name ,columns-name ,pkey-name
-          ,where-name ,all-name ,find-name ,count-name ,create-name ,save-name ,update-name ,delete-name)
+          ,where-name ,all-name ,find-name ,count-name ,create-name ,save-name ,update-name ,delete-name
+          ,hooks-name)
 
          ;; Scope policy is private to the model's module. #f preserves the
          ;; historical behavior for every existing define-model call.
          (,%define ,scope-name ,scope-expression)
+
+         ;; Lifecycle hooks. A plain define, so reloading this file rebinds a
+         ;; fresh record and any model/hook forms below re-register exactly once.
+         (,%define ,hooks-var-name (make-model-hooks))
+         (,%define (,hooks-name) ,hooks-var-name)
 
          ;; Load metadata function
          (,%define (,load-metadata-name)
@@ -350,7 +452,9 @@
 
          ;; Create function - takes alist, returns alist of created row
          (,%define (,create-name row-alist)
-		   (,%let* ((prepared-row (apply-model-scope-write ,scope-name row-alist))
+		   (,%let* ((hooked-row (run-before-hooks ,hooks-var-name 'before-create row-alist))
+			    ;; the scope is the security boundary, so it writes last
+			    (prepared-row (apply-model-scope-write ,scope-name hooked-row))
 			    (columns (,columns-name))
 			    (db-columns (,%map (,(r 'lambda) (col-spec)
 						(symbol->db-column (,%car col-spec))) columns))
@@ -363,13 +467,20 @@
 			    (query `(insert (into ,db-table-name)
 					    (columns ,@insert-columns)
 					    (values #(,@placeholders))))
-			    (new_id (db/execute query values 'last_insert_id)))
-			   ;; Return the created row by finding it with the new ID
-			   (,find-name '(= rowid ?) (,(r 'list) new_id))))
+			    (new_id (db/execute query values 'last_insert_id))
+			    ;; Re-read the created row by its new ID. This goes
+			    ;; through find, so it is scoped: an out-of-scope
+			    ;; insert comes back #f and after-create is skipped.
+			    (created-row (,find-name '(= rowid ?) (,(r 'list) new_id))))
+			   ;; returns created-row, and warns instead of running the
+			   ;; hooks when the insert landed outside the scope
+			   (run-after-hooks ,hooks-var-name 'after-create created-row)))
 
          ;; Save function - takes alist, updates existing row
          (,%define (,save-name row-alist)
-	           (,%let* ((prepared-row (apply-model-scope-write ,scope-name row-alist))
+	           (,%let* ((hooked-row (run-before-hooks ,hooks-var-name 'before-save row-alist))
+		            ;; the scope is the security boundary, so it writes last
+		            (prepared-row (apply-model-scope-write ,scope-name hooked-row))
 		            (columns (,columns-name))
 		            (pk-columns (get-primary-key-columns columns)))
 	                   (,(r 'let-values) (((pk-where pk-values)
@@ -397,7 +508,12 @@
 				                     (where ,(map-field-names->columns scoped-where (,%map ,%car columns))))))
 		                    (db/execute query all-values)
                                     ;; return a fresh version, because some fields might update on save
-                                    (,find-name '(= id ?) (list (alist-ref 'id prepared-row))))))))
+                                    ;; returns the re-fetched row, or #f (with a
+                                    ;; warning, hooks skipped) if the scoped
+                                    ;; UPDATE matched nothing
+                                    (run-after-hooks
+                                     ,hooks-var-name 'after-save
+                                     (,find-name '(= id ?) (,(r 'list) (,(r 'alist-ref) 'id prepared-row)))))))))
 
          ;; update function, wrapper around find -> save
          (,%define (,update-name id updates)
@@ -411,10 +527,13 @@
 
          ;; Delete function - takes alist, deletes the row
          (,%define (,delete-name row-alist)
+		   ;; before-delete is a fold like every other before-* hook, so the
+		   ;; PK for the DELETE comes from whatever the hooks returned.
+		   (,%let ((hooked-row (run-before-hooks ,hooks-var-name 'before-delete row-alist)))
 		   (,(r 'let-values) (((pk-where pk-values)
 				       (,%let* ((columns (,columns-name))
 						(pk-columns (get-primary-key-columns columns)))
-					       (build-pk-where pk-columns row-alist))))
+					       (build-pk-where pk-columns hooked-row))))
 		    (,(r 'let-values) (((scoped-where scoped-values)
 			                 (apply-model-scope-condition ,scope-name pk-where pk-values)))
 		    (,%let* ((columns (,%map ,%car (,columns-name)))
@@ -422,7 +541,10 @@
 			     (query `(delete (from ,db-table-name)
 			                    (where ,(map-field-names->columns scoped-where columns)))))
 			    (db/execute query scoped-values)
-			    #t))))
+			    ;; delete ignores rows_affected and always returns #t,
+			    ;; so after-delete fires even on a no-op delete.
+			    (run-after-hooks ,hooks-var-name 'after-delete hooked-row)
+			    #t)))))
 	 ;; load metadata
 	 (,load-metadata-name))))))
 
@@ -481,6 +603,43 @@
           (,%let* ((parent-pk (,(r 'alist-ref) 'id parent-row))
                    (updated-child (,(r 'alist-update) ',fk-column parent-pk child-row)))
 		  (,child-save-name updated-child))))))))
+
+;; Lifecycle hook sugar:
+;;   (model/hook users (before-create row) body ...)
+;;   (model/hook users ((before-create before-save) row) body ...)
+;; expands to a single closure registered against (users/hooks) for each event.
+;; The event symbol cannot be validated here (the event list is a runtime
+;; binding); model-hooks-add! validates it at the registering module's load time.
+(define-syntax model/hook
+  (er-macro-transformer
+   (lambda (x r c)
+     (let* ((table-name (cadr x))
+            (head (caddr x))
+            (body (cdddr x)))
+       (unless (and (list? head) (= (length head) 2))
+         (error "model/hook expects (model/hook table (event row) body ...)" x))
+       (let* ((event-spec (car head))
+              (formal (cadr head))
+              (events (if (list? event-spec) event-spec (list event-spec))))
+         (unless (symbol? formal)
+           (error "model/hook row parameter must be a symbol" formal))
+         (when (null? events)
+           (error "model/hook needs at least one event" x))
+         (for-each (lambda (event)
+                     (unless (symbol? event)
+                       (error "model/hook events must be symbols" event-spec)))
+                   events)
+         (when (null? body)
+           (error "model/hook needs a body" x))
+         (let ((hooks-name (string->symbol
+                            (conc (symbol->string table-name) "/hooks")))
+               (%hook (r 'hook)))
+           ;; hooks-name splices unrenamed so it resolves in the use-site module;
+           ;; the formal and body are user source and splice unrenamed too.
+           `(,(r 'let) ((,%hook (,(r 'lambda) (,formal) ,@body)))
+             ,@(map (lambda (event)
+                      `(,(r 'model-hooks-add!) (,hooks-name) ',event ,%hook))
+                    events))))))))
 
 ;; Migration system
 (define *migrations* '())

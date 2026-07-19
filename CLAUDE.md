@@ -37,10 +37,19 @@ Both backends use the `ssql` egg for S-expression SQL. Dialect translators are i
 These files are `include`d into their respective backend modules.
 
 ### The `define-model` Macro
-`define-model` is an `er-macro-transformer` that generates ~10 CRUD functions per model (e.g., `users/all`, `users/find`, `users/where`, `users/create`, `users/save`, `users/delete`). It introspects table schema at runtime via `PRAGMA table_info`. All query results use kebab-case keys (auto-converted from snake_case).
+`define-model` is an `er-macro-transformer` that generates ~10 CRUD functions per model (e.g., `users/all`, `users/find`, `users/where`, `users/create`, `users/save`, `users/delete`). It introspects table schema at runtime via `PRAGMA table_info`. All query results use kebab-case keys (auto-converted from snake_case). It also generates `<table>/hooks`, an accessor for the model's lifecycle hook registry (backed by the private `<table>/%hooks`), plus the private `<table>/%scope`.
 
 ### `model/has-many` Macro
 Another `er-macro-transformer` that generates relationship functions. Assumes convention: child table has `<singular-parent>-id` foreign key column.
+
+### Lifecycle Hooks
+`model/hook` is a third `er-macro-transformer`, pure sugar over `(model-hooks-add! (<table>/hooks) 'event proc)`. Six events map 1:1 onto the generated functions: `before-create`/`after-create`, `before-save`/`after-save`, `before-delete`/`after-delete`. There is no `before-update` because `users/update` delegates to `users/save`.
+
+Invariants worth preserving:
+- **Hooks do not cascade.** `create` fires only the create hooks (unlike ActiveRecord).
+- **`before-*` hooks are a left fold** (`row -> row`, registration order); **`after-*` hooks are observers** whose return values are discarded.
+- **Hooks run before `apply-model-scope-write`.** The scope is the security boundary and must be the last writer, so a hook can never clobber a scope-injected column. `tests/orm-tests.scm` pins this.
+- `run-after-hooks` takes the post-write re-fetch directly and returns it, so generated code uses it as its tail expression. It handles the `#f` (out-of-scope write) case by logging a warning and skipping the hooks. The warning must live in `run-after-hooks` rather than in the expansion, because `w` is bound in orm's module, not in the model's.
 
 ### Naming Convention
 Scheme kebab-case (`created-at`) auto-converts to/from SQL snake_case (`created_at`) via `symbol->db-column` and `db-column->symbol`.

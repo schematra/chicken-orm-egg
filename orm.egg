@@ -4,7 +4,7 @@
 
 ((synopsis "Simple ORM with define-model macro and pluggable backends for CHICKEN Scheme")
  (author "Rolando Abarca")
- (version "0.0.11")
+ (version "0.0.12")
  (license "BSD-3-Clause")
  (category db)
  (dependencies srfi-1 srfi-13 srfi-133 logger sql-null)

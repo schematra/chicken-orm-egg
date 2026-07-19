@@ -87,6 +87,7 @@ This generates the following functions:
 | `users/delete` | Delete a row |
 | `users/columns` | Get column metadata |
 | `users/pkey` | Get primary key column(s) |
+| `users/hooks` | Get the model's lifecycle hook registry |
 
 ### Mandatory Model Scopes
 
@@ -120,6 +121,70 @@ Scope callbacks should fail when required context is missing. A configured
 scope that returns no condition is rejected rather than falling back to an
 unscoped query. Direct `db/query` and `db/execute` calls bypass model scopes and
 remain the application's responsibility.
+
+### Lifecycle Hooks
+
+Where a scope is a single security policy, lifecycle hooks are ordinary
+application behavior: derive a slug before an insert, bust a cache after an
+update, write an audit row after a delete. Any number of hooks may be
+registered per event, and any module holding `(users/hooks)` can add one.
+
+```scheme
+(define-model users)
+
+(model/hook users (before-create row)
+  (alist-update 'slug (slugify (alist-ref 'name row)) row))
+
+(model/hook users (after-delete row)
+  (audit-log! 'deleted row))
+
+;; one body, several events
+(model/hook users ((before-create before-save) row)
+  (normalize-email row))
+```
+
+There are six events:
+
+| Event | Fires on |
+|-------|----------|
+| `before-create` / `after-create` | `users/create` |
+| `before-save` / `after-save` | `users/save` and `users/update` |
+| `before-delete` / `after-delete` | `users/delete` |
+
+**Hooks do not cascade.** This is the biggest difference from ActiveRecord: in
+Rails, `before_save` also runs on create. Here it does not. `users/create`
+fires *only* the create hooks. If you want a hook on both paths, list both
+events explicitly, as in the third example above. `users/update` delegates to
+`users/save`, so it fires the save hooks exactly once.
+
+`before-*` hooks are a **left fold**: each one is `row -> row`, they run in
+registration order, and each is fed the previous one's output. Returning
+something that is not an alist is an error. `after-*` hooks are **observers**:
+they receive the persisted row and their return values are ignored, so a hook
+that forgets to return the row cannot corrupt what `create` or `save` hands
+back.
+
+Hooks run **before** the scope's write procedure. The scope is the security
+boundary and must be the last writer, so a `before-create` hook can never
+clobber a scope-injected `account-id`. A hook that needs that value should read
+the application parameter the scope reads, rather than the row.
+
+A hook that calls `error` aborts the whole operation. There is no separate
+"cancel" protocol.
+
+Four sharp edges worth knowing:
+
+1. **`before-*` hooks fire even when the write affects zero rows.** There are no
+   transactions, and the scope check rides in the `UPDATE`'s `WHERE`, so a
+   `before-save` side effect has already happened by the time `save` returns `#f`.
+2. **`after-*` hooks are skipped when the post-write re-fetch returns `#f`**,
+   which is what an out-of-scope write looks like. The ORM logs a warning on
+   that path rather than failing silently.
+3. **`after-delete` fires even on a no-op delete.** `users/delete` ignores
+   `rows_affected` and always returns `#t`.
+4. **`before-delete` is a fold like the others**, so a hook that rewrites `id`
+   will delete a *different row*: the primary key for the `DELETE` comes from
+   whatever the hooks returned.
 
 ### Naming Conventions
 
@@ -200,7 +265,9 @@ The ORM automatically converts between Scheme's kebab-case and SQL's snake_case:
 ; => ((id . 3) (name . "Charlie") (email . "charlie@example.com") ...)
 ```
 
-The `create` function returns the newly created row (fetched by rowid).
+The `create` function returns the newly created row (fetched by rowid). It fires
+`before-create` (before the scope's write procedure) and then `after-create`.
+It does *not* fire the save hooks.
 
 ### Save (Update) an Existing Row
 
@@ -217,6 +284,11 @@ The `save` function:
 - Automatically sets `updated_at` to `CURRENT_TIMESTAMP`
 - Ignores `created-at` and `updated-at` in the input
 - Returns the fresh row from the database
+- Fires `before-save` (before the scope's write procedure) and then `after-save`
+
+`users/update` delegates to `users/save`, so it fires the save hooks once, not
+twice. If the scoped `UPDATE` matches no rows, `before-save` has already run but
+`after-save` is skipped.
 
 ### Update by ID
 
@@ -235,6 +307,10 @@ The `save` function:
 (let ((user (users/find '(= id ?) '(1))))
   (users/delete user))  ; => #t
 ```
+
+`delete` fires `before-delete` and then `after-delete`, both receiving the row
+the before-hooks returned. It always returns `#t`, even when no row matched, so
+`after-delete` fires on a no-op delete too.
 
 ## Migrations
 
@@ -477,6 +553,25 @@ Responses can be a list (each call consumes the next item; the last item repeats
 ```
 
 ## History
+
+### v0.0.12
+
+- Added lifecycle hooks: `(model/hook users (before-create row) ...)` registers
+  additive, multi-subscriber callbacks on a model.
+- Six events: `before-create`/`after-create`, `before-save`/`after-save`,
+  `before-delete`/`after-delete`. Hooks do **not** cascade, so `create` fires only
+  the create hooks (unlike ActiveRecord). A multi-event head registers one closure
+  against several events.
+- `before-*` hooks are a left fold (`row -> row`, in registration order);
+  `after-*` hooks are observers whose return values are ignored.
+- Hooks run before the scope's write procedure, so a hook can never clobber a
+  scope-injected column.
+- `define-model` now also generates `(users/hooks)`, which exposes the registry so
+  another module can register hooks.
+- New exports: `make-model-hooks`, `model-hooks?`, `model-hooks-add!`,
+  `model-hooks-ref`, `model-hooks-clear!`, `model-hook-event?`,
+  `model-hook-events`, `run-before-hooks`, `run-after-hooks`, `model/hook`.
+- Models that register no hooks are unchanged.
 
 ### v0.0.11
 

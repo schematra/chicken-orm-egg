@@ -110,6 +110,87 @@
   (test-error "alter mode rejects autoincrement"
     (column-spec->sql '(id integer (autoincrement #t)) #t)))
 
+(test-group "model hooks (unit)"
+  (test-assert "make-model-hooks makes a model-hooks record"
+    (model-hooks? (make-model-hooks)))
+  (test-assert "model-hooks? rejects other values"
+    (not (model-hooks? '())))
+
+  (test "ref on an unregistered event is empty"
+    '() (model-hooks-ref (make-model-hooks) 'before-create))
+
+  (test-error "add! rejects an unknown event"
+    (model-hooks-add! (make-model-hooks) 'before-frobnicate (lambda (row) row)))
+  (test-error "add! rejects a non-procedure"
+    (model-hooks-add! (make-model-hooks) 'before-create 'not-a-procedure))
+
+  (test "hooks run in registration order"
+    '(1 2 3)
+    (let ((hooks (make-model-hooks))
+          (calls '()))
+      (for-each (lambda (n)
+                  (model-hooks-add! hooks 'after-create
+                                    (lambda (row) (set! calls (cons n calls)))))
+                '(1 2 3))
+      (run-after-hooks hooks 'after-create '())
+      (reverse calls)))
+
+  (test "before-hooks chain left to right"
+    "a-1-2"
+    (let ((hooks (make-model-hooks)))
+      (model-hooks-add! hooks 'before-create
+                        (lambda (row) (alist-update 'v (string-append (alist-ref 'v row) "-1") row)))
+      (model-hooks-add! hooks 'before-create
+                        (lambda (row) (alist-update 'v (string-append (alist-ref 'v row) "-2") row)))
+      (alist-ref 'v (run-before-hooks hooks 'before-create '((v . "a"))))))
+
+  (test-error "before-hooks reject a non-list return"
+    (let ((hooks (make-model-hooks)))
+      (model-hooks-add! hooks 'before-create (lambda (row) 'nope))
+      (run-before-hooks hooks 'before-create '())))
+
+  (test "run-before-hooks with #f hooks is identity"
+    '((a . 1)) (run-before-hooks #f 'before-create '((a . 1))))
+  (test-assert "run-after-hooks with #f hooks is a no-op"
+    (run-after-hooks #f 'after-create '((a . 1))))
+
+  (test "after-hooks ignore return values but all run"
+    2
+    (let ((hooks (make-model-hooks))
+          (count 0))
+      (model-hooks-add! hooks 'after-save (lambda (row) (set! count (+ count 1)) 'garbage))
+      (model-hooks-add! hooks 'after-save (lambda (row) (set! count (+ count 1)) #f))
+      (run-after-hooks hooks 'after-save '())
+      count))
+
+  (test "clear! with an event clears only that event"
+    '(0 1)
+    (let ((hooks (make-model-hooks))
+          (noop (lambda (row) row)))
+      (model-hooks-add! hooks 'before-create noop)
+      (model-hooks-add! hooks 'before-save noop)
+      (model-hooks-clear! hooks 'before-create)
+      (list (length (model-hooks-ref hooks 'before-create))
+            (length (model-hooks-ref hooks 'before-save)))))
+
+  (test "clear! without an event clears everything"
+    '(0 0)
+    (let ((hooks (make-model-hooks))
+          (noop (lambda (row) row)))
+      (model-hooks-add! hooks 'before-create noop)
+      (model-hooks-add! hooks 'before-save noop)
+      (model-hooks-clear! hooks)
+      (list (length (model-hooks-ref hooks 'before-create))
+            (length (model-hooks-ref hooks 'before-save)))))
+
+  (test "model-hook-event? accepts every advertised event"
+    #f (memq #f (map model-hook-event? (model-hook-events))))
+  (test "model-hook-events lists exactly the supported events"
+    '(before-create after-create before-save after-save before-delete after-delete)
+    (model-hook-events))
+  (test-assert "model-hook-event? rejects anything else"
+    (not (model-hook-event? 'before-update))))
+
 ;; --- Integration tests (require SQLite) ---
 
 (test-group "orm integration (sqlite)"
@@ -143,6 +224,25 @@
          (alist-update 'account-id account-id row)))))
 
   (define-model scoped-records scope: account-scope)
+
+  ;; --- Lifecycle hook fixtures ---
+  (db/execute "CREATE TABLE hooked_records (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, tag TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+  (define-model hooked-records)
+  (model/has-many users hooked-records)
+
+  (db/execute "CREATE TABLE hooked_scoped (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, name TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+  (define-model hooked-scoped scope: account-scope)
+
+  ;; Hooks are global mutable state on the model, so they leak between cases
+  ;; unless every test brackets itself.
+  (define (with-hooks thunk)
+    (define (clear!)
+      (model-hooks-clear! (hooked-records/hooks))
+      (model-hooks-clear! (hooked-scoped/hooks)))
+    (clear!)
+    (let ((result (thunk)))
+      (clear!)
+      result))
 
   (test-group "define-model generated functions"
     (test-group "columns and metadata"
@@ -288,6 +388,167 @@
        (make-model-scope (lambda () (values #f '())))
        #f
        '())))
+
+  (test-group "model hooks (define-model)"
+    (db/execute "DELETE FROM hooked_records")
+    (db/execute "DELETE FROM hooked_scoped")
+
+    (test "before-create transforms the inserted row"
+      "tagged"
+      (with-hooks
+       (lambda ()
+         (model/hook hooked-records (before-create row)
+           (alist-update 'tag "tagged" row))
+         (let ((created (hooked-records/create '((name . "a")))))
+           ;; assert on what actually landed in the table, not the returned alist
+           (alist-ref 'tag
+                      (vector-ref (db/query "SELECT tag FROM hooked_records WHERE id = ?"
+                                            (list (alist-ref 'id created)))
+                                  0))))))
+
+    (test "before-create hooks chain in registration order"
+      "x-1-2"
+      (with-hooks
+       (lambda ()
+         (model/hook hooked-records (before-create row)
+           (alist-update 'tag (string-append (alist-ref 'tag row) "-1") row))
+         (model/hook hooked-records (before-create row)
+           (alist-update 'tag (string-append (alist-ref 'tag row) "-2") row))
+         (alist-ref 'tag (hooked-records/create '((name . "b") (tag . "x")))))))
+
+    (test "after-create receives the persisted row"
+      #t
+      (with-hooks
+       (lambda ()
+         (let ((seen #f))
+           (model/hook hooked-records (after-create row)
+             (set! seen (alist-ref 'id row)))
+           (let ((created (hooked-records/create '((name . "c")))))
+             (and seen (equal? seen (alist-ref 'id created))))))))
+
+    ;; Pins the no-cascade decision: create fires ONLY create hooks.
+    (test "create does not fire save hooks"
+      0
+      (with-hooks
+       (lambda ()
+         (let ((saves 0))
+           (model/hook hooked-records ((before-save after-save) row)
+             (set! saves (+ saves 1))
+             row)
+           (hooked-records/create '((name . "d")))
+           saves))))
+
+    (test "save hooks fire exactly once through update"
+      '(1 1)
+      (with-hooks
+       (lambda ()
+         (let ((before 0) (after 0)
+               (row (hooked-records/create '((name . "e")))))
+           (model/hook hooked-records (before-save r)
+             (set! before (+ before 1))
+             r)
+           (model/hook hooked-records (after-save r)
+             (set! after (+ after 1)))
+           (hooked-records/update (alist-ref 'id row) '((name . "e2")))
+           (list before after)))))
+
+    (test "save hooks fire exactly once through add-hooked-records"
+      '(1 1)
+      (with-hooks
+       (lambda ()
+         (let ((before 0) (after 0)
+               (parent (users/create '((name . "Parent"))))
+               (child (hooked-records/create '((name . "f")))))
+           (model/hook hooked-records (before-save r)
+             (set! before (+ before 1))
+             r)
+           (model/hook hooked-records (after-save r)
+             (set! after (+ after 1)))
+           (users/add-hooked-records parent child)
+           (list before after)))))
+
+    ;; Wart #1 and #2 together: the before hook has already run (and its side
+    ;; effect happened) when a scoped update matches nothing, but after is skipped.
+    (test "before-save fires and after-save is skipped on a zero-row scoped update"
+      '(#f 1 0)
+      (with-hooks
+       (lambda ()
+         (let ((before 0) (after 0))
+           (let ((row (parameterize ((current-account-id 2))
+                        (hooked-scoped/create '((name . "owned by 2"))))))
+             (model/hook hooked-scoped (before-save r)
+               (set! before (+ before 1))
+               r)
+             (model/hook hooked-scoped (after-save r)
+               (set! after (+ after 1)))
+             (let ((result (parameterize ((current-account-id 1))
+                             (hooked-scoped/save (alist-update 'name "nope" row)))))
+               (list result before after)))))))
+
+    (test "before-delete and after-delete fire, after-delete sees the pre-delete row"
+      '("g" 0)
+      (with-hooks
+       (lambda ()
+         (db/execute "DELETE FROM hooked_records")
+         (let ((seen #f)
+               (row (hooked-records/create '((name . "g")))))
+           (model/hook hooked-records (before-delete r) r)
+           (model/hook hooked-records (after-delete r)
+             (set! seen (alist-ref 'name r)))
+           (hooked-records/delete row)
+           (list seen (hooked-records/count))))))
+
+    (test "an error in a before-hook aborts the operation"
+      0
+      (with-hooks
+       (lambda ()
+         (db/execute "DELETE FROM hooked_records")
+         (model/hook hooked-records (before-create row)
+           (error "nope"))
+         (handle-exceptions exn #t
+           (hooked-records/create '((name . "h"))))
+         (hooked-records/count))))
+
+    ;; The ordering test: hooks run first, the scope writes last, so a hook can
+    ;; never clobber a scope-injected column.
+    (test "scope wins over a before-create hook"
+      1
+      (with-hooks
+       (lambda ()
+         (model/hook hooked-scoped (before-create row)
+           (alist-update 'account-id 999 row))
+         (parameterize ((current-account-id 1))
+           (alist-ref 'account-id (hooked-scoped/create '((name . "scoped"))))))))
+
+    (test "hooks are per-model"
+      0
+      (with-hooks
+       (lambda ()
+         (let ((count 0))
+           (model/hook hooked-records (before-create row)
+             (set! count (+ count 1))
+             row)
+           (users/create '((name . "Unrelated")))
+           count))))
+
+    (test "model/hook multi-event head shares one closure across events"
+      2
+      (with-hooks
+       (lambda ()
+         (let ((count 0))
+           (model/hook hooked-records ((before-create before-save) row)
+             (set! count (+ count 1))
+             row)
+           (let ((row (hooked-records/create '((name . "i")))))
+             (hooked-records/save (alist-update 'name "i2" row)))
+           count))))
+
+    (test-error "registering an unknown event errors"
+      (model-hooks-add! (hooked-records/hooks) 'before-update (lambda (row) row)))
+
+    ;; Leave both models clean so the migrations group is unaffected.
+    (model-hooks-clear! (hooked-records/hooks))
+    (model-hooks-clear! (hooked-scoped/hooks)))
 
   ;; --- Migration tests ---
   (test-group "migrations"

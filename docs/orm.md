@@ -145,6 +145,10 @@ Scope callbacks should signal an error when required context is unavailable.
 A configured scope that returns `#f` as its condition is rejected. Raw
 `db/query` and `db/execute` calls are not model operations and bypass scopes.
 
+The model's `before-*` lifecycle hooks run *before* the scope's write callback,
+so the scope is always the last writer and a hook cannot overwrite a
+scope-injected column. See "API: Lifecycle Hooks" below.
+
 For a model named `users`, the generated functions are listed below. Each example shows the SQL that is produced (the SQLite dialect; rqlite renders identically). Assume `users` has columns `id`, `name`, `email`.
 
 #### `(users/all #!key limit order offset)`
@@ -223,6 +227,8 @@ Return the number of matching rows (all rows if no conditions).
 
 Insert a new row and return it (re-fetched by rowid). Pairs whose value is `'()` are dropped, so only supplied columns are inserted.
 
+Fires `before-create`, then the scope's write callback, then the `INSERT`, then `after-create`. It does not fire the save hooks.
+
 ```scheme
 (users/create '((name . "Charlie") (email . "charlie@example.com")))
 ; => ((id . 3) (name . "Charlie") ...)
@@ -234,6 +240,8 @@ Insert a new row and return it (re-fetched by rowid). Pairs whose value is `'()`
 
 Update an existing row, matched by primary key, and return the fresh row. Only non-primary-key, non-timestamp columns appear in the `SET` list; `updated_at` is always set to `CURRENT_TIMESTAMP`, and `created-at` / `updated-at` in the input are ignored.
 
+Fires `before-save`, then the scope's write callback, then the `UPDATE`, then `after-save`. If the scoped `UPDATE` matches nothing, `save` returns `#f`: `before-save` has already run, but `after-save` is skipped and a warning is logged.
+
 ```scheme
 (let* ((user (users/find '(= id ?) '(1)))
        (updated (alist-update 'name "Alicia" user)))
@@ -244,7 +252,7 @@ Update an existing row, matched by primary key, and return the fresh row. Only n
 
 #### `(users/update id updates)`
 
-Convenience wrapper: find the row by `id`, apply the `updates` alist, and save. Returns the updated row, or `#f` if the id is not found.
+Convenience wrapper: find the row by `id`, apply the `updates` alist, and save. Returns the updated row, or `#f` if the id is not found. Because it delegates to `users/save`, it fires the save hooks exactly once. There is no separate `before-update` event.
 
 ```scheme
 (users/update 1 '((name . "Alicia") (status . "inactive")))
@@ -254,6 +262,8 @@ Convenience wrapper: find the row by `id`, apply the `updates` alist, and save. 
 #### `(users/delete row-alist)`
 
 Delete the row identified by the primary key in `row-alist`. Returns `#t`.
+
+Fires `before-delete`, then the `DELETE`, then `after-delete`. Both receive the row the before-hooks returned, and the primary key for the `DELETE` is taken from that same value. The return value is `#t` regardless of how many rows matched, so `after-delete` fires on a no-op delete as well. The scope's write callback is not applied here.
 
 ```scheme
 (let ((user (users/find '(= id ?) '(1))))
@@ -268,6 +278,130 @@ Return the table's column metadata.
 #### `(users/pkey)`
 
 Return the primary key column name(s) as a list.
+
+#### `(users/hooks)`
+
+Return the model's `model-hooks` registry. This is what makes hooks registrable
+from a different module than the one holding the `define-model`, and it is what
+the `model/hook` macro expands into.
+
+```scheme
+(model-hooks-add! (users/hooks) 'before-create (lambda (row) row))
+```
+
+## API: Lifecycle Hooks (model/hook)
+
+Lifecycle hooks are additive, multi-subscriber callbacks attached to a model.
+Unlike a model scope, which is a single security policy, any number of hooks may
+be registered per event, by any module that can call `(users/hooks)`.
+
+The six events are `before-create`, `after-create`, `before-save`, `after-save`,
+`before-delete` and `after-delete`.
+
+**Hooks do not cascade.** Unlike ActiveRecord, where `before_save` also runs on
+create, an event here fires only for its own operation. To run one body on both
+paths, list both events.
+
+`before-*` hooks are a left fold: each is `row -> row`, they run in registration
+order, and each receives the previous one's output. A `before-*` hook that
+returns a non-list signals an error. `after-*` hooks are observers: they receive
+the persisted row and their return values are discarded.
+
+A hook that calls `error` aborts the operation.
+
+Ordering per operation:
+
+```
+create:  before-create hooks (in order)
+           -> scope write callback
+           -> INSERT
+           -> re-fetch (scoped)
+           -> after-create hooks       [skipped + warning if re-fetch is #f]
+
+save:    before-save hooks (in order)
+           -> scope write callback
+           -> UPDATE ... WHERE pk AND scope
+           -> re-fetch (scoped)
+           -> after-save hooks         [skipped + warning if re-fetch is #f]
+
+delete:  before-delete hooks (in order)
+           -> DELETE ... WHERE pk AND scope   [pk taken from the hooks' result]
+           -> after-delete hooks       [always run; delete always returns #t]
+```
+
+Because there are no transactions and the scope check rides in the `WHERE`
+clause, a `before-*` hook's side effects have already happened even when the
+write ultimately affects zero rows.
+
+#### `(model/hook table (event row) body ...)`
+
+Macro. Register a hook on `table` for `event`, binding the incoming row alist to
+`row` in `body`. The head may also be `((event ...) row)`, which registers one
+shared closure against each listed event.
+
+```scheme
+(model/hook users (before-create row)
+  (alist-update 'slug (slugify (alist-ref 'name row)) row))
+
+(model/hook users (after-delete row)
+  (audit-log! 'deleted row))
+
+(model/hook users ((before-create before-save) row)
+  (normalize-email row))
+```
+
+Expands to a `model-hooks-add!` call per event against `(table/hooks)`. The
+event symbol cannot be checked at expansion time, so an unknown event is
+reported by `model-hooks-add!` when the registering module is loaded.
+
+Registration happens as a side effect of loading the form, and `define-model`
+binds a fresh registry, so reloading a file containing both a `define-model` and
+its `model/hook` forms re-registers each hook exactly once rather than
+accumulating duplicates.
+
+#### `(make-model-hooks)`
+
+Return a new, empty `model-hooks` registry. `define-model` calls this for you;
+it is exported mainly for testing.
+
+#### `(model-hooks? x)`
+
+Return `#t` if `x` is a `model-hooks` registry.
+
+#### `(model-hooks-add! hooks event proc)`
+
+Append `proc` to `event`'s hook list. Appending means registration order is run
+order. Signals an error for an invalid registry, an unknown event, or a
+non-procedure.
+
+#### `(model-hooks-ref hooks event)`
+
+Return the list of procedures registered for `event`, or `'()`.
+
+#### `(model-hooks-clear! hooks [event])`
+
+Remove the hooks for `event`, or all hooks when `event` is omitted. Primarily
+useful for test isolation, since a model's registry is global mutable state
+shared across a test file.
+
+#### `(model-hook-events)`
+
+Return the list of supported event symbols.
+
+#### `(model-hook-event? event)`
+
+Return `#t` if `event` is one of the supported events.
+
+#### `(run-before-hooks hooks event row)`
+
+Fold `row` through `event`'s hooks and return the result. When `hooks` is `#f`,
+returns `row` unchanged. Signals an error if any hook returns a non-list.
+
+#### `(run-after-hooks hooks event row)`
+
+Run `event`'s hooks for effect and return `row`. When `row` is `#f`, the hooks
+are skipped and a warning is logged, since that indicates a write that landed
+outside the model's scope. When `hooks` is `#f`, this is a no-op.
 
 ## API: Relationships (model/has-many)
 
