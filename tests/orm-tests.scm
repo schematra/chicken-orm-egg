@@ -1,4 +1,4 @@
-(import orm orm-db orm-db-sqlite)
+(import orm orm-db orm-db-sqlite orm-test)
 
 ;; --- Pure utility function tests (no DB needed) ---
 
@@ -191,6 +191,203 @@
   (test-assert "model-hook-event? rejects anything else"
     (not (model-hook-event? 'before-update))))
 
+;; --- Query descriptors (mock backend, no real DB) ---
+
+;; A hand-built model: descriptors only need a table, a columns thunk and a
+;; scope, so these tests don't go through define-model's PRAGMA introspection.
+(define widget-columns-calls 0)
+(define (widget-columns)
+  (set! widget-columns-calls (+ widget-columns-calls 1))
+  '((id integer (primary-key)) (name text) (created-at datetime) (owner-id integer)))
+
+(define widget-owner (make-parameter #f))
+(define widget-scope
+  (make-model-scope
+   (lambda ()
+     (unless (widget-owner)
+       (error "widget owner required"))
+     (values '(= owner-id ?) (list (widget-owner))))))
+
+(define (widgets/q) (make-model-query 'widgets widget-columns #f))
+(define (owned-widgets/q) (make-model-query 'widgets widget-columns widget-scope))
+
+(define widget-select '(select (columns id name created_at owner_id) (from widgets)))
+
+;; Runs thunk with a fresh mock backend connected; thunk gets the spy.
+(define (with-mock thunk)
+  (let-values (((backend spy) (make-mock-backend)))
+    (parameterize ((db/backend backend) (db/connection 'mock-connection))
+      (thunk spy))))
+
+;; The (ssql params) the mock saw for running q.
+(define (rendered q)
+  (with-mock
+   (lambda (spy)
+     (q/run q)
+     (car (spy 'queries)))))
+
+(test-group "query descriptors"
+  (test-assert "users/q style constructor makes a descriptor"
+    (model-query? (widgets/q)))
+  (test-assert "model-query? rejects other values"
+    (not (model-query? '())))
+
+  (test "building touches neither the DB nor the model's columns"
+    0
+    (begin
+      (set! widget-columns-calls 0)
+      (parameterize ((db/backend #f) (db/connection #f))
+        (q/then (q/count (q/offset (q/limit (q/order (q/where (owned-widgets/q) '(= name ?) "a")
+                                                     'name)
+                                            5)
+                                   10))
+                add1))
+      widget-columns-calls))
+
+  (test "a bare descriptor selects every column"
+    (list widget-select '())
+    (rendered (widgets/q)))
+
+  (test "builders return new descriptors and leave the original alone"
+    (list widget-select '())
+    (let ((base (widgets/q)))
+      (q/limit (q/where base '(= name ?) "a") 3)
+      (rendered base)))
+
+  (test "several q/where calls AND together, values in call order"
+    (list (append widget-select '((where (and (= name ?) (> id ?) (= owner_id ?)))))
+          '("a" 3 7))
+    (rendered (q/where (q/where (q/where (widgets/q) '(= name ?) "a") '(> id ?) 3)
+                       '(= owner-id ?) 7)))
+
+  (test "q/where with several values"
+    (list (append widget-select '((where (between id ? ?)))) '(1 9))
+    (rendered (q/where (widgets/q) '(between id ? ?) 1 9)))
+
+  (test "order converts kebab-case fields"
+    (list (append widget-select '((order (desc created_at)))) '())
+    (rendered (q/order (widgets/q) '(desc created-at))))
+
+  (test "order accepts a bare field"
+    (list (append widget-select '((order created_at))) '())
+    (rendered (q/order (widgets/q) 'created-at)))
+
+  (test "limit and offset"
+    (list (append widget-select '((limit 10) (offset 20))) '())
+    (rendered (q/offset (q/limit (widgets/q) 10) 20)))
+
+  (test "q/by-id is a first by id"
+    (list (append widget-select '((where (= id ?)) (limit 1))) '(42))
+    (rendered (q/by-id (widgets/q) 42)))
+
+  (test "q/count ignores order, limit and offset"
+    (list '(select (columns (as (count *) _count)) (from widgets) (where (= name ?))) '("a"))
+    (rendered (q/count (q/offset (q/limit (q/order (q/where (widgets/q) '(= name ?) "a") 'id) 5) 2))))
+
+  (test "rows come back with kebab-case keys"
+    '#(((owner-id . 1) (created-at . "x")))
+    (with-mock
+     (lambda (spy)
+       (spy 'on-query (lambda (sql params) (vector '((owner_id . 1) (created_at . "x")))))
+       (q/run (widgets/q)))))
+
+  (test "q/first returns the first row"
+    '((owner-id . 1))
+    (with-mock
+     (lambda (spy)
+       (spy 'on-query (lambda (sql params) (vector '((owner_id . 1)))))
+       (q/run (q/first (widgets/q))))))
+
+  (test "q/first returns #f when nothing matches"
+    #f
+    (with-mock (lambda (spy) (q/run (q/first (widgets/q))))))
+
+  (test "q/count returns the count"
+    7
+    (with-mock
+     (lambda (spy)
+       (spy 'on-query (lambda (sql params) (vector '((_count . 7)))))
+       (q/run (q/count (widgets/q))))))
+
+  (test "q/count returns 0 on an empty result"
+    0
+    (with-mock (lambda (spy) (q/run (q/count (widgets/q))))))
+
+  (test "q/then composes in order"
+    30
+    (with-mock
+     (lambda (spy)
+       (spy 'on-query (lambda (sql params) (vector '((_count . 2)))))
+       (q/run (q/then (q/then (q/count (widgets/q)) add1)
+                      (lambda (n) (* n 10)))))))
+
+  (test-error "q/then rejects a non-procedure"
+    (q/then (widgets/q) 'nope))
+
+  (test "the scope is applied at run time, ANDed first"
+    (list (append widget-select '((where (and (= owner_id ?) (= name ?))))) '(5 "a"))
+    (let ((q (q/where (owned-widgets/q) '(= name ?) "a")))
+      (parameterize ((widget-owner 5))
+        (rendered q))))
+
+  (test-error "running a scoped descriptor without context fails closed"
+    (rendered (owned-widgets/q)))
+
+  (test "q/run-all returns one value per descriptor, in order"
+    '(3 ((name . "w")) 2)
+    (with-mock
+     (lambda (spy)
+       (spy 'on-query (list (vector '((_count . 3)))
+                            (vector '((name . "w")))
+                            (vector '((id . 1)) '((id . 2)))))
+       (receive (n first rows)
+           (q/run-all (q/count (widgets/q))
+                      (q/first (widgets/q))
+                      (widgets/q))
+         (list n first (vector-length rows))))))
+
+  (test "q/run-list returns a list"
+    '(0 #f)
+    (with-mock
+     (lambda (spy)
+       (q/run-list (list (q/count (widgets/q)) (q/first (widgets/q)))))))
+
+  (test "q/run-list of no descriptors is empty"
+    '()
+    (with-mock (lambda (spy) (q/run-list '())))))
+
+(test-group "batching"
+  (test "q/run-all of 3 descriptors sends 1 batch with 3 statements"
+    '(1 3 3)
+    (with-mock
+     (lambda (spy)
+       (q/run-all (widgets/q) (q/count (widgets/q)) (q/by-id (widgets/q) 1))
+       (list (length (spy 'batches))
+             (length (car (spy 'batches)))
+             (length (spy 'queries))))))
+
+  (test "batched statements carry their own params"
+    '((select (columns (as (count *) _count)) (from widgets) (where (= name ?))) "a")
+    (with-mock
+     (lambda (spy)
+       (q/run-all (widgets/q) (q/count (q/where (widgets/q) '(= name ?) "a")))
+       (cadr (car (spy 'batches))))))
+
+  (test "q/run does not batch"
+    '(0 1)
+    (with-mock
+     (lambda (spy)
+       (q/run (widgets/q))
+       (list (length (spy 'batches)) (length (spy 'queries))))))
+
+  (test "a scope error in one descriptor sends nothing"
+    '(error 0 0)
+    (with-mock
+     (lambda (spy)
+       (let ((result (handle-exceptions exn 'error
+                       (q/run-all (widgets/q) (owned-widgets/q)))))
+         (list result (length (spy 'batches)) (length (spy 'queries))))))))
+
 ;; --- Integration tests (require SQLite) ---
 
 (test-group "orm integration (sqlite)"
@@ -269,22 +466,22 @@
         (users/create '((name . "Bob") (email . "bob@example.com")))
 
         (test "count returns correct number"
-          2 (users/count))
+          2 (q/run (q/count (users/q))))
 
         (test "count with condition"
-          1 (users/count '(= name ?) '("Alice")))
+          1 (q/run (q/count (q/where (users/q) '(= name ?) "Alice"))))
 
         (test "all returns vector of all rows"
-          2 (vector-length (users/all)))
+          2 (vector-length (q/run (users/q))))
 
         (test "where filters correctly"
-          1 (vector-length (users/where '(= name ?) '("Alice"))))
+          1 (vector-length (q/run (q/where (users/q) '(= name ?) "Alice"))))
 
         (test "find returns single row"
-          "Alice" (alist-ref 'name (users/find '(= name ?) '("Alice"))))
+          "Alice" (alist-ref 'name (q/run (q/first (q/where (users/q) '(= name ?) "Alice")))))
 
         (test "find returns #f when not found"
-          #f (users/find '(= name ?) '("Nobody")))
+          #f (q/run (q/first (q/where (users/q) '(= name ?) "Nobody"))))
 
         ;; Save (update)
         (let ((updated (users/save (alist-update 'name "Alice Updated" alice))))
@@ -300,13 +497,13 @@
         (test-assert "delete returns #t"
           (users/delete alice))
         (test "count after delete"
-          1 (users/count)))))
+          1 (q/run (q/count (users/q)))))))
 
   (test-group "model scopes"
     (db/execute "DELETE FROM scoped_records")
 
     (test-error "missing scope context fails closed"
-      (scoped-records/all))
+      (q/run (scoped-records/q)))
 
     (let* ((account-1-row
             (parameterize ((current-account-id 1))
@@ -323,22 +520,22 @@
         (test "all is scoped"
           '("Account 1")
           (map (lambda (row) (alist-ref 'name row))
-               (vector->list (scoped-records/all))))
+               (vector->list (q/run (scoped-records/q)))))
 
         (test "where combines scope and caller conditions"
           1
           (vector-length
-           (scoped-records/where '(= name ?) '("Account 1"))))
+           (q/run (q/where (scoped-records/q) '(= name ?) "Account 1"))))
 
         (test "find cannot load another scope by primary key"
           #f
-          (scoped-records/find '(= id ?) (list (alist-ref 'id account-2-row))))
+          (q/run (q/by-id (scoped-records/q) (alist-ref 'id account-2-row))))
 
         (test "count is scoped"
-          1 (scoped-records/count))
+          1 (q/run (q/count (scoped-records/q))))
 
         (test "count combines scope and caller conditions"
-          0 (scoped-records/count '(= name ?) '("Account 2")))
+          0 (q/run (q/count (q/where (scoped-records/q) '(= name ?) "Account 2"))))
 
         (test "save is atomically scoped"
           #f
@@ -377,11 +574,10 @@
         (test "delete removes an owned row"
           #t
           (scoped-records/delete
-           (scoped-records/find
-            '(= id ?) (list (alist-ref 'id account-1-row)))))
+           (q/run (q/by-id (scoped-records/q) (alist-ref 'id account-1-row)))))
 
         (test "owned row is gone"
-          0 (scoped-records/count))))
+          0 (q/run (q/count (scoped-records/q))))))
 
     (test-error "a scope may not silently return no condition"
       (apply-model-scope-condition
@@ -496,7 +692,7 @@
            (model/hook hooked-records (after-delete r)
              (set! seen (alist-ref 'name r)))
            (hooked-records/delete row)
-           (list seen (hooked-records/count))))))
+           (list seen (q/run (q/count (hooked-records/q))))))))
 
     (test "an error in a before-hook aborts the operation"
       0
@@ -507,7 +703,7 @@
            (error "nope"))
          (handle-exceptions exn #t
            (hooked-records/create '((name . "h"))))
-         (hooked-records/count))))
+         (q/run (q/count (hooked-records/q))))))
 
     ;; The ordering test: hooks run first, the scope writes last, so a hook can
     ;; never clobber a scope-injected column.
@@ -549,6 +745,49 @@
     ;; Leave both models clean so the migrations group is unaffected.
     (model-hooks-clear! (hooked-records/hooks))
     (model-hooks-clear! (hooked-scoped/hooks)))
+
+  (test-group "relationships (has-many)"
+    (db/execute "DELETE FROM hooked_records")
+    (let* ((parent (users/create '((name . "Rel Parent"))))
+           (other (users/create '((name . "Rel Other")))))
+      (users/add-hooked-records parent (hooked-records/create '((name . "r1") (tag . "a"))))
+      (users/add-hooked-records parent (hooked-records/create '((name . "r2") (tag . "b"))))
+      (users/add-hooked-records other (hooked-records/create '((name . "r3") (tag . "a"))))
+
+      (test-assert "parent -> children is a descriptor"
+        (model-query? (users/hooked-records/q parent)))
+
+      (test "parent -> children runs to the parent's rows"
+        '("r1" "r2")
+        (map (lambda (row) (alist-ref 'name row))
+             (vector->list (q/run (q/order (users/hooked-records/q parent) 'id)))))
+
+      (test "parent -> children refines with q/"
+        '("r2")
+        (map (lambda (row) (alist-ref 'name row))
+             (vector->list (q/run (q/where (users/hooked-records/q parent) '(= tag ?) "b")))))
+
+      (test "child -> parent runs to the parent row"
+        "Rel Parent"
+        (alist-ref 'name
+                   (q/run (hooked-records/users/q
+                           (q/run (q/first (q/where (hooked-records/q) '(= name ?) "r1")))))))
+
+      (test "child -> parent with a NULL foreign key runs to #f"
+        #f
+        (q/run (hooked-records/users/q
+                (hooked-records/create '((name . "orphan")))))))
+    (db/execute "DELETE FROM hooked_records"))
+
+  (test-group "q/run-all (sqlite fallback)"
+    (let ((total (vector-length (q/run (users/q)))))
+      (receive (n bob rows)
+          (q/run-all (q/count (users/q))
+                     (q/first (q/where (users/q) '(= name ?) "Bob"))
+                     (q/limit (users/q) 1))
+        (test "count" total n)
+        (test "first" "Bob" (alist-ref 'name bob))
+        (test "rows" 1 (vector-length rows)))))
 
   ;; --- Migration tests ---
   (test-group "migrations"

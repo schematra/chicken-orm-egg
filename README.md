@@ -39,10 +39,10 @@ chicken-install orm-db-rqlite  ; if using rqlite
 (define-model users)
 
 ;; Query all users
-(users/all)  ; => #(((id . 1) (name . "Alice") ...) ...)
+(q/run (users/q))  ; => #(((id . 1) (name . "Alice") ...) ...)
 
 ;; Find a specific user
-(users/find '(= id ?) '(1))  ; => ((id . 1) (name . "Alice") ...)
+(q/run (q/by-id (users/q) 1))  ; => ((id . 1) (name . "Alice") ...)
 ```
 
 ## Database Setup
@@ -77,10 +77,7 @@ This generates the following functions:
 
 | Function | Description |
 |----------|-------------|
-| `users/all` | Get all rows |
-| `users/find` | Find a single row |
-| `users/where` | Query with conditions |
-| `users/count` | Count matching rows |
+| `users/q` | Start a query descriptor (see [Querying](#querying)) |
 | `users/create` | Insert a new row |
 | `users/save` | Update an existing row |
 | `users/update` | Find and update by ID |
@@ -111,8 +108,8 @@ applies to every generated CRUD operation:
 (define-model invoices scope: account-scope)
 ```
 
-The scope condition is combined before caller conditions for `all`, `find`,
-`where`, and `count`. It is also included directly in the `WHERE` clause for
+The scope condition is ANDed into every `users/q` read when the descriptor
+runs (not when it is built), ahead of the caller's conditions. It is also included directly in the `WHERE` clause for
 `save`, `update`, and `delete`, so a primary key from another scope cannot be
 modified. The write callback runs before `create` and `save`, allowing the
 application to stamp or validate ownership fields.
@@ -196,65 +193,90 @@ The ORM automatically converts between Scheme's kebab-case and SQL's snake_case:
 
 ## Querying
 
-### Get All Rows
+Reads are values. `users/q` returns a **query descriptor**; the `q/` functions
+refine it and return a new descriptor, and nothing touches the database until a
+runner executes it. That lets independent reads be sent together: on rqlite,
+`q/run-all` costs one HTTP round trip instead of one per query.
 
 ```scheme
-;; Get all users
-(users/all)  ; => #(((id . 1) (name . "Alice")) ((id . 2) (name . "Bob")))
-
-;; With limit
-(users/all limit: 10)
-
-;; With ordering
-(users/all order: 'name)              ; ascending by name
-(users/all order: '(desc created-at)) ; descending by created_at
+(q/run (users/q))  ; => #(((id . 1) (name . "Alice")) ((id . 2) (name . "Bob")))
 ```
 
-### Find a Single Row
+Every builder takes the descriptor first, so a threading macro such as `->`
+(from `clojurist`, or your own) reads naturally. The ORM itself does not depend
+on one: nested calls work the same.
 
 ```scheme
-;; Find by condition (returns single alist or #f)
-(users/find '(= id ?) '(1))
-; => ((id . 1) (name . "Alice") (email . "alice@example.com"))
+(q/run (-> (users/q)
+           (q/where '(= status ?) "active")
+           (q/order '(desc created-at))
+           (q/limit 10)))
 
-(users/find '(= email ?) '("bob@example.com"))
+;; the same thing, without ->
+(q/run (q/limit (q/order (q/where (users/q) '(= status ?) "active")
+                         '(desc created-at))
+                10))
+```
+
+### Builders
+
+| Function | Description |
+|----------|-------------|
+| `(q/where q cond val ...)` | Add a condition; values follow it. Several calls AND together, values in call order |
+| `(q/order q order)` | `field`, `(asc field)` or `(desc field)`; kebab-case fields are converted |
+| `(q/limit q n)` | `LIMIT n` |
+| `(q/offset q n)` | `OFFSET n` |
+| `(q/first q)` | Run to the first row (an alist) or `#f` |
+| `(q/count q)` | Run to the integer count of matching rows (ignores order, limit, offset) |
+| `(q/by-id q id)` | Shorthand for `(q/first (q/where q '(= id ?) id))` |
+| `(q/then q proc)` | Post-process the final value; several calls compose in order |
+
+```scheme
+;; Conditions
+(q/where (users/q) '(= status ?) "active")
+(q/where (users/q) '(and (= status ?) (> age ?)) "active" 18)
+(-> (users/q) (q/where '(= status ?) "active") (q/where '(> age ?) 18)) ; same thing
+(q/where (users/q) '(like name ?) "%alice%")
+(q/where (users/q) '(is deleted-at ?) 'null)
+
+;; A single row
+(q/run (q/first (q/where (users/q) '(= email ?) "bob@example.com")))
 ; => ((id . 2) (name . "Bob") (email . "bob@example.com"))
+(q/run (q/by-id (users/q) 999))  ; => #f
 
-;; Returns #f if not found
-(users/find '(= id ?) '(999))  ; => #f
+;; Counting
+(q/run (q/count (users/q)))                                  ; => 42
+(q/run (q/count (q/where (users/q) '(= status ?) "active"))) ; => 15
+
+;; Post-processing
+(q/run (q/then (users/q) (lambda (rows) (map (cut alist-ref 'name <>) (vector->list rows)))))
+; => ("Alice" "Bob")
 ```
 
-### Query with Conditions
+### Running
+
+| Function | Description |
+|----------|-------------|
+| `(q/run q)` | Run one descriptor |
+| `(q/run-all q ...)` | Run several in one batch, returning one value per descriptor |
+| `(q/run-list qs)` | Same as `q/run-all`, but takes and returns a list |
 
 ```scheme
-;; Basic equality
-(users/where '(= status ?) '("active"))
-
-;; Multiple conditions
-(users/where '(and (= status ?) (> age ?)) '("active" 18))
-
-;; With limit and order
-(users/where '(= status ?) '("active") limit: 10 order: '(desc created-at))
-
-;; Comparison operators: =, <>, <, >, <=, >=
-(users/where '(>= age ?) '(21))
-
-;; LIKE queries
-(users/where '(like name ?) '("%alice%"))
-
-;; NULL checks
-(users/where '(is deleted-at ?) '(null))
+(receive (user posts unread)
+    (q/run-all (q/by-id (users/q) uid)
+               (-> (posts/q) (q/where '(= published ?) 1) (q/limit 10))
+               (-> (notifications/q) (q/where '(= user-id ?) uid) (q/count)))
+  ...)  ; one round trip on rqlite
 ```
 
-### Count Rows
+Batches go through `db/batch`. The rqlite backend sends every statement in a
+single request; SQLite (and any backend without native batching) runs them one
+after the other, so the same code works everywhere.
 
-```scheme
-;; Count all
-(users/count)  ; => 42
-
-;; Count with condition
-(users/count '(= status ?) '("active"))  ; => 15
-```
+The model scope is applied when a descriptor **runs**, not when it is built, so a
+descriptor built outside a `parameterize` picks up the scope context at run time.
+`q/run-list` renders every descriptor before sending anything: if one scope fails
+closed, no statement is sent.
 
 ## Creating and Updating
 
@@ -272,7 +294,7 @@ It does *not* fire the save hooks.
 ### Save (Update) an Existing Row
 
 ```scheme
-(let ((user (users/find '(= id ?) '(1))))
+(let ((user (q/run (q/by-id (users/q) 1))))
   ;; Modify the user
   (let ((updated-user (alist-update 'name "Alicia" user)))
     ;; Save changes
@@ -293,7 +315,7 @@ twice. If the scoped `UPDATE` matches no rows, `before-save` has already run but
 ### Update by ID
 
 ```scheme
-;; Convenience wrapper: find by ID, apply updates, save
+;; Convenience wrapper: look up by ID, apply updates, save
 (users/update 1 '((name . "Alicia") (status . "inactive")))
 ; => ((id . 1) (name . "Alicia") (status . "inactive") ...)
 
@@ -304,7 +326,7 @@ twice. If the scoped `UPDATE` matches no rows, `before-save` has already run but
 ## Deleting
 
 ```scheme
-(let ((user (users/find '(= id ?) '(1))))
+(let ((user (q/run (q/by-id (users/q) 1))))
   (users/delete user))  ; => #t
 ```
 
@@ -441,23 +463,31 @@ This generates:
 
 | Function | Description |
 |----------|-------------|
-| `users/posts` | Get all posts for a user |
-| `posts/users` | Get the user for a post |
-| `users/add-posts` | Associate a post with a user |
+| `(users/posts/q user)` | Descriptor for a user's posts |
+| `(posts/users/q post)` | Descriptor for a post's user (runs to a row or `#f`) |
+| `(users/add-posts user post)` | Associate a post with a user (a write, runs immediately) |
+
+The read side returns descriptors, so they refine with `q/` and batch like any
+other query:
 
 ```scheme
-;; Get all posts for a user
-(let ((user (users/find '(= id ?) '(1))))
-  (users/posts user))  ; => #(((id . 1) (title . "Post 1") ...) ...)
+(let ((user (q/run (q/by-id (users/q) 1))))
+  ;; All posts for a user
+  (q/run (users/posts/q user))  ; => #(((id . 1) (title . "Post 1") ...) ...)
 
-;; Get the user for a post
-(let ((post (posts/find '(= id ?) '(1))))
-  (posts/users post))  ; => ((id . 1) (name . "Alice") ...)
+  ;; With additional conditions
+  (q/run (-> (users/posts/q user)
+             (q/where '(= published ?) 1)
+             (q/order '(desc created-at))
+             (q/limit 5))))
 
-;; With additional conditions
-(let ((user (users/find '(= id ?) '(1))))
-  (users/posts user '(= published ?) '(#t)))
+;; The user for a post
+(let ((post (q/run (q/by-id (posts/q) 1))))
+  (q/run (posts/users/q post)))  ; => ((id . 1) (name . "Alice") ...)
 ```
+
+A post with a missing or NULL `user-id` still gets a descriptor from
+`posts/users/q`; it matches nothing and runs to `#f`.
 
 ## Helper Functions
 
@@ -466,7 +496,7 @@ This generates:
 Get a value from a row, treating SQL NULL as a default:
 
 ```scheme
-(let ((user (users/find '(= id ?) '(1))))
+(let ((user (q/run (q/by-id (users/q) 1))))
   (row-ref/default 'name user)           ; => "Alice"
   (row-ref/default 'nickname user "N/A") ; => "N/A" if NULL
   (row-ref/default 'missing user))       ; => error: key doesn't exist
@@ -478,11 +508,11 @@ For tables with a `metadata` TEXT column storing s-expressions:
 
 ```scheme
 ;; Read metadata (returns alist, or default if NULL/invalid)
-(let ((user (users/find '(= id ?) '(1))))
+(let ((user (q/run (q/by-id (users/q) 1))))
   (row-metadata user))  ; => ((theme . "dark") (language . "en"))
 
 ;; Set metadata (returns updated row alist)
-(let ((user (users/find '(= id ?) '(1))))
+(let ((user (q/run (q/by-id (users/q) 1))))
   (row-metadata-set! user '((theme . "light"))))
 ```
 
@@ -499,7 +529,7 @@ For tables with a `metadata` TEXT column storing s-expressions:
 
 ## Testing with orm-test
 
-The `orm-test` module (bundled in the `orm` egg) provides a mock database backend for testing code that uses `orm-db` without requiring a real database connection. It's installed automatically with `orm` — no separate install needed.
+The `orm-test` module (bundled in the `orm` egg) provides a mock database backend for testing code that uses `orm-db` without requiring a real database connection. It's installed automatically with `orm`, no separate install needed.
 
 ### make-mock-backend
 
@@ -518,10 +548,10 @@ The `orm-test` module (bundled in the `orm` egg) provides a mock database backen
   (spy 'on-query (list (vector '((id . 1) (name . "Alice")))))
 
   ;; Now any query will return the configured response
-  (users/all)  ; => #(((id . 1) (name . "Alice")))
+  (q/run (users/q))  ; => #(((id . 1) (name . "Alice")))
 
   ;; Inspect what SQL was executed
-  (spy 'queries)  ; => (("SELECT ..." ()))
+  (spy 'queries)  ; => (((select ...) ()))
   )
 ```
 
@@ -531,9 +561,21 @@ The `orm-test` module (bundled in the `orm` egg) provides a mock database backen
 |---------|-----------|-------------|
 | `queries` | none | Returns list of `(sql params)` pairs from all queries |
 | `executions` | none | Returns list of `(sql params out-key)` from all executions |
+| `batches` | none | Returns list of batches, each the list of `(sql . params)` statements passed to `db/batch` |
 | `on-query` | responses-or-proc | Set query responses: a list (consumed in order, last repeats) or a `(lambda (sql params) ...)` |
 | `on-execute` | responses-or-proc | Set execute responses: a list or a `(lambda (sql params out-key) ...)` |
-| `reset!` | none | Clear recorded queries and executions |
+| `reset!` | none | Clear recorded queries, executions and batches |
+
+The mock implements native batching: each `db/batch` call (and so each
+`q/run-all`) is recorded once in `batches`, and every statement in it is also
+answered by the `on-query` handler and logged in `queries`. That makes "these
+three reads cost one round trip" easy to assert:
+
+```scheme
+(q/run-all (users/q) (q/count (posts/q)) (q/by-id (users/q) 1))
+(length (spy 'batches))        ; => 1
+(length (car (spy 'batches)))  ; => 3
+```
 
 ### Configuring Responses
 
@@ -553,6 +595,43 @@ Responses can be a list (each call consumes the next item; the last item repeats
 ```
 
 ## History
+
+### v0.0.13
+
+**Breaking:** the generated read functions are gone. `define-model` no longer
+generates `users/all`, `users/find`, `users/where` or `users/count`, and
+`model/has-many` reads gained a `/q` suffix. There is no deprecation release.
+
+- `define-model` generates `(users/q)`, which returns a query descriptor. The new
+  `q/` library builds descriptors (`q/where`, `q/order`, `q/limit`, `q/offset`,
+  `q/first`, `q/count`, `q/by-id`, `q/then`) and runs them (`q/run`, `q/run-all`,
+  `q/run-list`).
+- `q/run-all` / `q/run-list` send several reads in one `db/batch`: one HTTP round
+  trip on rqlite, sequential everywhere else.
+- `orm-db` adds `db/batch` and an optional `batch` backend entry, with a
+  sequential fallback through `query`. `orm-db-rqlite` (now 0.0.13, to match the
+  release tag) implements it natively, sending every statement in one request.
+  `orm-db-sqlite` is unchanged and stays at 0.0.10.
+- The model scope is applied when a descriptor runs, last, exactly as before.
+- `orm-test`'s mock backend supports batching and records a `batches` spy log.
+
+Migrating:
+
+| Before | After |
+|--------|-------|
+| `(users/all)` | `(q/run (users/q))` |
+| `(users/all limit: 10 order: 'name)` | `(q/run (-> (users/q) (q/order 'name) (q/limit 10)))` |
+| `(users/where c '(v ...))` | `(q/run (q/where (users/q) c v ...))` |
+| `(users/where c vs offset: 20)` | `(q/run (-> (users/q) (q/where c v ...) (q/offset 20)))` |
+| `(users/find c '(v ...))` | `(q/run (-> (users/q) (q/where c v ...) (q/first)))` |
+| `(users/find '(= id ?) (list id))` | `(q/run (q/by-id (users/q) id))` |
+| `(users/count)` | `(q/run (q/count (users/q)))` |
+| `(users/count c '(v ...))` | `(q/run (q/count (q/where (users/q) c v ...)))` |
+| `(users/posts user)` | `(q/run (users/posts/q user))` |
+| `(users/posts user c '(v ...) limit: 5)` | `(q/run (-> (users/posts/q user) (q/where c v ...) (q/limit 5)))` |
+| `(posts/users post)` | `(q/run (posts/users/q post))` |
+
+Note that `q/where` takes its values as rest arguments, not as a list.
 
 ### v0.0.12
 

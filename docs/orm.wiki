@@ -45,8 +45,8 @@ chicken-install orm-db-rqlite   ; if using rqlite
 (define-model users)
 
 ;; Query
-(users/all)                    ; => #(((id . 1) (name . "Alice") ...) ...)
-(users/find '(= id ?) '(1))    ; => ((id . 1) (name . "Alice") ...)
+(q/run (users/q))                 ; => #(((id . 1) (name . "Alice") ...) ...)
+(q/run (q/by-id (users/q) 1))     ; => ((id . 1) (name . "Alice") ...)
 </enscript>
 
 === Naming Conventions
@@ -66,7 +66,7 @@ The ORM automatically converts between Scheme's kebab-case and SQL's snake_case:
 
 === API: Database Layer (orm-db)
 
-The {{orm-db}} module defines a backend-agnostic interface using CHICKEN parameters. A backend is an alist mapping the symbols {{connect}}, {{close}}, {{query}}, and {{execute}} to procedures; the backend eggs provide constructors ({{sqlite3-backend}}, {{rqlite-backend}}) that return such an alist.
+The {{orm-db}} module defines a backend-agnostic interface using CHICKEN parameters. A backend is an alist mapping the symbols {{connect}}, {{close}}, {{query}}, and {{execute}} (and optionally {{batch}}) to procedures; the backend eggs provide constructors ({{sqlite3-backend}}, {{rqlite-backend}}) that return such an alist.
 
 <parameter>(db/backend [backend])</parameter>
 
@@ -102,6 +102,16 @@ Run a SELECT. {{ssql-or-string}} is either a raw SQL string or an {{ssql}} S-exp
 
 Run an INSERT/UPDATE/DELETE/DDL statement. {{out-key}} selects which value the backend returns (default {{rows_affected}}; e.g. {{last_insert_rowid}}).
 
+<procedure>(db/batch statements)</procedure>
+
+Run several read statements and return a list of row vectors, one per statement, in order. {{statements}} is a list of {{(ssql-or-string . params)}} pairs. If the backend provides a {{batch}} entry ({{(conn statements) -> list of row vectors}}), it is used, so a backend like rqlite can send everything in one request. Otherwise {{db/batch}} falls back to calling the backend's {{query}} once per statement. An empty list returns {{'()}} without touching the backend. Batches are for reads only. {{q/run-list}} and {{q/run-all}} are built on it.
+
+<enscript highlight="scheme">
+(db/batch '(("SELECT * FROM users WHERE id = ?" 1)
+            ("SELECT COUNT(*) AS n FROM posts")))
+; => (#(((id . 1) ...)) #(((n . 12))))
+</enscript>
+
 === API: Models (define-model)
 
 <syntax>(define-model name [scope: model-scope])</syntax>
@@ -129,87 +139,33 @@ An optional model scope supplies a mandatory query condition and a row preparati
 (define-model invoices scope: account-scope)
 </enscript>
 
-The condition callback takes no arguments and returns two values: an {{ssql}} condition and its placeholder-value list. The ORM places this condition before any caller condition for {{all}}, {{find}}, {{where}}, and {{count}}, and includes it in the same SQL {{WHERE}} for {{save}}, {{update}}, and {{delete}}. This makes scoped writes atomic rather than a check followed by an unscoped primary-key mutation.
+The condition callback takes no arguments and returns two values: an {{ssql}} condition and its placeholder-value list. The ORM places this condition before any caller condition whenever a {{users/q}} descriptor is run (it is applied at run time, not when the descriptor is built), and includes it in the same SQL {{WHERE}} for {{save}}, {{update}}, and {{delete}}. This makes scoped writes atomic rather than a check followed by an unscoped primary-key mutation.
 
-The optional write callback receives and returns a row alist. It runs before {{create}} and {{save}}; {{update}} delegates to scoped {{find}} and {{save}}. If omitted, it defaults to the identity function. Scope callbacks should signal an error when required context is unavailable. A configured scope that returns {{#f}} as its condition is rejected. Raw {{db/query}} and {{db/execute}} calls bypass model scopes.
+The optional write callback receives and returns a row alist. It runs before {{create}} and {{save}}; {{update}} delegates to a scoped lookup by id and {{save}}. If omitted, it defaults to the identity function. Scope callbacks should signal an error when required context is unavailable. A configured scope that returns {{#f}} as its condition is rejected. Raw {{db/query}} and {{db/execute}} calls bypass model scopes.
 
 The model's {{before-*}} lifecycle hooks run before the scope's write callback, so the scope is always the last writer and a hook cannot overwrite a scope-injected column. See "API: Lifecycle Hooks" below.
 
 For a model named {{users}}, the generated functions are listed below. Each example shows the SQL that is produced (the SQLite dialect; rqlite renders identically). Assume {{users}} has columns {{id}}, {{name}}, {{email}}.
 
-<procedure>(users/all #!key limit order offset)</procedure>
+<procedure>(users/q)</procedure>
 
-Return all rows as a vector of alists.
+Return a query descriptor for the model: a value describing a {{SELECT}} over all of the table's columns, with the model's scope attached. Building and refining a descriptor never touches the database; run it with {{q/run}} (or batch several with {{q/run-all}}). See "API: Queries (q/)" below for the builders.
 
 <enscript highlight="scheme">
-(users/all)
+(q/run (users/q))
 ;; SQL: SELECT id, name, email FROM users
 
-(users/all limit: 10)
-;; SQL: SELECT id, name, email FROM users LIMIT 10
+(q/run (q/limit (q/order (users/q) '(desc created-at)) 10))
+;; SQL: SELECT id, name, email FROM users ORDER BY created_at DESC LIMIT 10
 
-(users/all order: 'name)               ; ascending
-;; SQL: SELECT id, name, email FROM users ORDER BY name
-
-(users/all order: '(desc created-at))  ; descending
-;; SQL: SELECT id, name, email FROM users ORDER BY created_at DESC
-</enscript>
-
-Note how the column list comes from the introspected schema, and kebab-case names in {{order}} are converted to snake_case.
-
-<procedure>(users/find [conditions] [values] #!key order)</procedure>
-
-Return a single row (alist) matching {{conditions}}, or {{#f}} if none. {{conditions}} is an {{ssql}} WHERE form with {{?}} placeholders, {{values}} the bound values.
-
-<enscript highlight="scheme">
-(users/find '(= id ?) '(1))
+(q/run (q/by-id (users/q) 1))   ; => ((id . 1) ...) or #f
 ;; SQL: SELECT id, name, email FROM users WHERE (id = ?) LIMIT 1
 
-(users/find '(= email ?) '("bob@example.com"))
-;; SQL: SELECT id, name, email FROM users WHERE (email = ?) LIMIT 1
-
-(users/find '(= id ?) '(999))   ; => #f
-</enscript>
-
-{{find}} is just {{where}} with {{limit: 1}}, returning the single row or {{#f}}.
-
-<procedure>(users/where [conditions] [values] #!key limit order offset)</procedure>
-
-Return all rows matching {{conditions}} as a vector of alists.
-
-<enscript highlight="scheme">
-(users/where '(= status ?) '("active"))
-;; SQL: SELECT id, name, email, status FROM users WHERE (status = ?)
-
-(users/where '(and (= status ?) (> age ?)) '("active" 18))
-;; SQL: SELECT ... FROM users WHERE ((status = ?) AND (age > ?))
-
-(users/where '(>= age ?) '(21))
-;; SQL: SELECT ... FROM users WHERE (age >= ?)
-
-(users/where '(like name ?) '("%alice%"))
-;; SQL: SELECT ... FROM users WHERE (name LIKE ?)
-
-(users/where '(is deleted-at ?) '(null))
-;; SQL: SELECT ... FROM users WHERE (deleted_at IS ?)
-
-(users/where '(= status ?) '("active") limit: 10 order: '(desc created-at))
-;; SQL: SELECT ... FROM users WHERE (status = ?) ORDER BY created_at DESC LIMIT 10
-</enscript>
-
-Comparison operators: {{=}}, {{<>}}, {{<}}, {{>}}, {{<=}}, {{>=}}, {{like}}, {{is}}. The {{conditions}} form is an {{ssql}} expression; {{?}} placeholders are bound positionally from {{values}}.
-
-<procedure>(users/count [conditions] [values])</procedure>
-
-Return the number of matching rows (all rows if no conditions).
-
-<enscript highlight="scheme">
-(users/count)                       ; => 42
-;; SQL: SELECT COUNT(*) AS _count FROM users
-
-(users/count '(= status ?) '("active"))  ; => 15
+(q/run (q/count (q/where (users/q) '(= status ?) "active")))   ; => 15
 ;; SQL: SELECT COUNT(*) AS _count FROM users WHERE (status = ?)
 </enscript>
+
+The column list comes from the introspected schema. On a scoped model, the scope condition is ANDed in front of the caller's conditions when the descriptor is run, inside whatever {{parameterize}} is active at that point. A scope that cannot produce its condition signals an error (fails closed).
 
 <procedure>(users/create row-alist)</procedure>
 
@@ -231,7 +187,7 @@ Update an existing row, matched by primary key, and return the fresh row. Sets {
 Fires {{before-save}}, then the scope's write callback, then the {{UPDATE}}, then {{after-save}}. If the scoped {{UPDATE}} matches nothing, {{save}} returns {{#f}}: {{before-save}} has already run, but {{after-save}} is skipped and a warning is logged.
 
 <enscript highlight="scheme">
-(let* ((user (users/find '(= id ?) '(1)))
+(let* ((user (q/run (q/by-id (users/q) 1)))
        (updated (alist-update 'name "Alicia" user)))
   (users/save updated))
 ;; SQL: UPDATE users SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE (id = ?)
@@ -256,7 +212,7 @@ Delete the row identified by the primary key in {{row-alist}}. Returns {{#t}}.
 Fires {{before-delete}}, then the {{DELETE}}, then {{after-delete}}. Both receive the row the before-hooks returned, and the primary key for the {{DELETE}} is taken from that same value. The return value is {{#t}} regardless of how many rows matched, so {{after-delete}} fires on a no-op delete as well. The scope's write callback is not applied here.
 
 <enscript highlight="scheme">
-(let ((user (users/find '(= id ?) '(1))))
+(let ((user (q/run (q/by-id (users/q) 1))))
   (users/delete user))
 ;; SQL: DELETE FROM users WHERE (id = ?)
 </enscript>
@@ -276,6 +232,131 @@ Return the model's {{model-hooks}} registry. This is what makes hooks registrabl
 <enscript highlight="scheme">
 (model-hooks-add! (users/hooks) 'before-create (lambda (row) row))
 </enscript>
+
+=== API: Queries (q/)
+
+Model reads are values. {{users/q}} returns a query descriptor; the {{q/}} builders take a descriptor as their first argument and return a new one (descriptors are immutable, so a base query can be shared and refined freely). Nothing is rendered, scoped or sent until a runner ({{q/run}}, {{q/run-list}}, {{q/run-all}}) executes it.
+
+Because the descriptor always comes first, the builders thread naturally with a {{->}} macro. The {{orm}} egg does not provide or depend on one: use {{->}} from an egg such as {{clojurist}}, or nest the calls.
+
+<enscript highlight="scheme">
+;; with a -> macro
+(q/run (-> (users/q)
+           (q/where '(= status ?) "active")
+           (q/order '(desc created-at))
+           (q/limit 10)))
+
+;; the same, nested
+(q/run (q/limit (q/order (q/where (users/q) '(= status ?) "active")
+                         '(desc created-at))
+                10))
+</enscript>
+
+<procedure>(make-model-query table columns-thunk scope)</procedure>
+
+Create a bare descriptor for {{table}} (a symbol), where {{columns-thunk}} returns the column specs (e.g. {{users/columns}}) and {{scope}} is a {{model-scope}} or {{#f}}. {{define-model}} generates {{users/q}} from this; you rarely call it directly.
+
+<procedure>(model-query? x)</procedure>
+
+Return {{#t}} if {{x}} is a query descriptor.
+
+<procedure>(q/where q condition value ...)</procedure>
+
+Add an {{ssql}} condition with {{?}} placeholders, bound positionally to the {{value}}s. Several {{q/where}} calls AND together, and their values are bound in call order. Model field names in the condition are converted to snake_case.
+
+<enscript highlight="scheme">
+(q/where (users/q) '(= status ?) "active")
+;; WHERE (status = ?)
+
+(q/where (q/where (users/q) '(= status ?) "active") '(> age ?) 18)
+;; WHERE ((status = ?) AND (age > ?))   params: ("active" 18)
+
+(q/where (users/q) '(between age ? ?) 18 65)
+(q/where (users/q) '(like name ?) "%alice%")
+(q/where (users/q) '(is deleted-at ?) 'null)
+;; WHERE (deleted_at IS ?)
+</enscript>
+
+Comparison operators: {{=}}, {{<>}}, {{<}}, {{>}}, {{<=}}, {{>=}}, {{like}}, {{is}}, and anything else {{ssql}} supports.
+
+<procedure>(q/order q order)</procedure>
+
+Set the ordering. {{order}} is a field, {{(asc field)}} or {{(desc field)}}; kebab-case model fields are converted to snake_case.
+
+<enscript highlight="scheme">
+(q/order (users/q) 'name)               ; ORDER BY name
+(q/order (users/q) '(desc created-at))  ; ORDER BY created_at DESC
+</enscript>
+
+<procedure>(q/limit q n)</procedure>
+<procedure>(q/offset q n)</procedure>
+
+Set {{LIMIT}} / {{OFFSET}}.
+
+<procedure>(q/first q)</procedure>
+
+Run as a single row: the first match as an alist, or {{#f}} when nothing matches. Sets the limit to 1.
+
+<procedure>(q/count q)</procedure>
+
+Run as the integer number of matching rows (0 when none). Order, limit and offset are ignored.
+
+<enscript highlight="scheme">
+(q/run (q/count (q/limit (users/q) 5)))
+;; SQL: SELECT COUNT(*) AS _count FROM users
+</enscript>
+
+<procedure>(q/then q proc)</procedure>
+
+Post-process the final value: {{proc}} receives what the descriptor would otherwise return (row vector, row or {{#f}}, or count). Several {{q/then}} calls compose in order. Because the transformation travels with the descriptor, it also applies inside a batch.
+
+<enscript highlight="scheme">
+(q/run (q/then (q/count (users/q)) zero?))   ; => #t on an empty table
+
+(q/run (q/then (users/q)
+               (lambda (rows) (map (lambda (r) (alist-ref 'name r))
+                                   (vector->list rows)))))
+; => ("Alice" "Bob")
+</enscript>
+
+<procedure>(q/by-id q id)</procedure>
+
+Shorthand for {{(q/first (q/where q '(= id ?) id))}}.
+
+<procedure>(q/run q)</procedure>
+
+Render and run a single descriptor with {{db/query}}, returning a vector of row alists (kebab-case keys), a single row or {{#f}} ({{q/first}}), or an integer ({{q/count}}), after any {{q/then}} procedures.
+
+<procedure>(q/run-list qs)</procedure>
+
+Run a list of descriptors and return a list of their results, in order. Every descriptor is rendered first, so a scope error in any of them aborts the call before anything is sent. The statements then go to the database in a single {{db/batch}}, which is one round trip on backends with native batching (rqlite) and one query per statement elsewhere (SQLite).
+
+<procedure>(q/run-all q ...)</procedure>
+
+Like {{q/run-list}}, but takes the descriptors as arguments and returns their results as multiple values.
+
+<enscript highlight="scheme">
+(receive (user posts unread)
+    (q/run-all (q/by-id (users/q) uid)
+               (q/limit (q/where (posts/q) '(= published ?) 1) 10)
+               (q/count (q/where (notifications/q) '(= user-id ?) uid)))
+  ...)   ; one HTTP request on rqlite
+</enscript>
+
+==== Migrating from 0.0.12
+
+Version 0.0.13 removed the immediate read functions in favour of descriptors:
+
+* {{(users/all)}} becomes {{(q/run (users/q))}}
+* {{(users/where c v ...)}} becomes {{(q/run (q/where (users/q) c v ...))}}
+* {{(users/find c v)}} becomes {{(q/run (q/first (q/where (users/q) c v)))}}
+* {{(users/find '(= id ?) (list id))}} becomes {{(q/run (q/by-id (users/q) id))}}
+* {{(users/count)}} becomes {{(q/run (q/count (users/q)))}}
+* {{limit:}} / {{order:}} / {{offset:}} becomes {{q/limit}} / {{q/order}} / {{q/offset}}
+* {{(users/posts user)}} becomes {{(q/run (users/posts/q user))}}
+* {{(posts/users post)}} becomes {{(q/run (posts/users/q post))}}
+
+Note that {{where}}/{{find}}/{{count}} took their values as a list; {{q/where}} takes them as separate arguments.
 
 === API: Lifecycle Hooks (model/hook)
 
@@ -380,28 +461,28 @@ Declare a has-many relationship between two existing models. Assumes the convent
 
 This generates three functions:
 
-<procedure>(users/posts parent-row [conditions] [values] #!key limit order offset)</procedure>
+<procedure>(users/posts/q parent-row)</procedure>
 
-Return all child rows belonging to {{parent-row}}, optionally further filtered.
+Return a query descriptor for the child rows belonging to {{parent-row}}. Refine it with the {{q/}} builders and run it with {{q/run}}, or batch it with {{q/run-all}}.
 
 <enscript highlight="scheme">
-(let ((user (users/find '(= id ?) '(1))))
-  (users/posts user))
+(let ((user (q/run (q/by-id (users/q) 1))))
+  (q/run (users/posts/q user)))
 ;; SQL: SELECT id, user_id, title FROM posts WHERE (user_id = ?)
 
-;; with extra conditions
-(let ((user (users/find '(= id ?) '(1))))
-  (users/posts user '(= published ?) '(#t)))
-;; SQL: SELECT ... FROM posts WHERE ((user_id = ?) AND (published = ?))
+;; refined with q/
+(let ((user (q/run (q/by-id (users/q) 1))))
+  (q/run (q/limit (q/where (users/posts/q user) '(= published ?) 1) 5)))
+;; SQL: SELECT ... FROM posts WHERE ((user_id = ?) AND (published = ?)) LIMIT 5
 </enscript>
 
-<procedure>(posts/users child-row)</procedure>
+<procedure>(posts/users/q child-row)</procedure>
 
-Return the parent row for {{child-row}}.
+Return a {{q/first}} descriptor for the parent row of {{child-row}}, so it runs to the parent alist or {{#f}}. If the child's foreign key is missing or NULL, the result is still a descriptor (one that matches nothing), so it can be batched like any other.
 
 <enscript highlight="scheme">
-(let ((post (posts/find '(= id ?) '(1))))
-  (posts/users post))   ; => ((id . 1) (name . "Alice") ...)
+(let ((post (q/run (q/by-id (posts/q) 1))))
+  (q/run (posts/users/q post)))   ; => ((id . 1) (name . "Alice") ...)
 ;; SQL: SELECT id, name, email FROM users WHERE (id = ?) LIMIT 1
 </enscript>
 
@@ -588,17 +669,18 @@ Returns two values: a backend alist (compatible with {{db/backend}}) and a {{spy
   ;; Configure responses
   (spy 'on-query (list (vector '((id . 1) (name . "Alice")))))
 
-  (users/all)        ; => #(((id . 1) (name . "Alice")))
-  (spy 'queries))    ; => (("SELECT ..." ()))
+  (q/run (users/q))  ; => #(((id . 1) (name . "Alice")))
+  (spy 'queries))    ; => ((<ssql form> ()))
 </enscript>
 
 The {{spy}} procedure responds to these messages:
 
 * {{(spy 'queries)}} — list of {{(sql params)}} pairs from all queries
 * {{(spy 'executions)}} — list of {{(sql params out-key)}} from all executions
+* {{(spy 'batches)}}: list of statement lists, one per {{db/batch}} call (each statement is {{(sql . params)}}). Batched statements are also answered by the query handler and recorded in {{queries}}, so a test can assert "3 reads, 1 batch"
 * {{(spy 'on-query responses-or-proc)}} — set query responses: a list (consumed in order, last item repeats) or a {{(lambda (sql params) ...)}}
 * {{(spy 'on-execute responses-or-proc)}} — set execute responses: a list or a {{(lambda (sql params out-key) ...)}}
-* {{(spy 'reset!)}} — clear recorded queries and executions
+* {{(spy 'reset!)}}: clear recorded queries, executions and batches
 
 <enscript highlight="scheme">
 ;; Static list of responses (last item repeats forever)
@@ -650,7 +732,13 @@ The {{spy}} procedure responds to these messages:
 (define alice (users/create '((name . "Alice"))))
 (users/add-posts alice (posts/create `((title . "Hello") (user-id . ,(alist-ref 'id alice)))))
 
-(users/posts alice)   ; => #(((id . 1) (title . "Hello") ...))
+(q/run (users/posts/q alice))   ; => #(((id . 1) (title . "Hello") ...))
+
+;; several independent reads in one batch
+(receive (n latest)
+    (q/run-all (q/count (users/q))
+               (q/first (q/order (posts/q) '(desc id))))
+  (print n " users, latest post: " (alist-ref 'title latest)))
 
 (db/close)
 </enscript>

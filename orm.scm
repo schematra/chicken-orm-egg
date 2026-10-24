@@ -24,6 +24,19 @@
  model-hook-events
  run-before-hooks
  run-after-hooks
+ make-model-query
+ model-query?
+ q/where
+ q/order
+ q/limit
+ q/offset
+ q/first
+ q/count
+ q/then
+ q/by-id
+ q/run
+ q/run-list
+ q/run-all
  model/hook
  define-model
  model/has-many
@@ -201,6 +214,154 @@
               (model-hooks-ref hooks event))
     row)))
 
+;; Query descriptors. A model read is a value built with the q/ functions
+;; and executed later by q/run (one statement) or q/run-list / q/run-all (one
+;; db/batch, a single round trip on backends with native batching). Nothing
+;; touches the database, or the model scope, until a runner renders it.
+(define-record-type model-query
+  (%make-model-query table columns scope conditions order limit offset shape thens)
+  model-query?
+  (table model-query-table)
+  ;; thunk returning the model's column specs (i.e. users/columns)
+  (columns model-query-columns)
+  (scope model-query-scope)
+  ;; list of (condition . values), in call order
+  (conditions model-query-conditions)
+  (order model-query-order)
+  (limit model-query-limit)
+  (offset model-query-offset)
+  ;; rows | first | count
+  (shape model-query-shape)
+  ;; post-processing procedures, applied in order to the final value
+  (thens model-query-thens))
+
+(define (make-model-query table columns-thunk scope)
+  (%make-model-query table columns-thunk scope '() #f #f #f 'rows '()))
+
+(define (check-model-query q)
+  (unless (model-query? q)
+    (error "not a model query" q)))
+
+;; Functional update: a copy of q with one field replaced.
+(define (model-query-with q field value)
+  (check-model-query q)
+  (let ((get (lambda (name accessor)
+               (if (eq? name field) value (accessor q)))))
+    (%make-model-query (model-query-table q)
+                       (model-query-columns q)
+                       (model-query-scope q)
+                       (get 'conditions model-query-conditions)
+                       (get 'order model-query-order)
+                       (get 'limit model-query-limit)
+                       (get 'offset model-query-offset)
+                       (get 'shape model-query-shape)
+                       (get 'thens model-query-thens))))
+
+;; Conditions given to several q/where calls are ANDed together.
+(define (q/where q condition . vals)
+  (check-model-query q)
+  (model-query-with q 'conditions
+                    (append (model-query-conditions q)
+                            (list (cons condition vals)))))
+
+;; order: field | (asc field) | (desc field)
+(define (q/order q order) (model-query-with q 'order order))
+(define (q/limit q n) (model-query-with q 'limit n))
+(define (q/offset q n) (model-query-with q 'offset n))
+
+;; Run as a single row: the first match as an alist, or #f.
+(define (q/first q)
+  (model-query-with (model-query-with q 'limit 1) 'shape 'first))
+
+;; Run as the integer count of matching rows (order/limit/offset are ignored).
+(define (q/count q) (model-query-with q 'shape 'count))
+
+;; Post-process the final value; several q/then calls compose in order.
+(define (q/then q proc)
+  (unless (procedure? proc)
+    (error "q/then expects a procedure" proc))
+  (check-model-query q)
+  (model-query-with q 'thens (append (model-query-thens q) (list proc))))
+
+(define (q/by-id q id)
+  (q/first (q/where q '(= id ?) id)))
+
+;; Fold (condition . values) pairs into one condition (or #f) and its values.
+(define (combine-query-conditions conditions)
+  (cond
+   ((null? conditions) (values #f '()))
+   ((null? (cdr conditions)) (values (caar conditions) (cdar conditions)))
+   (else (values `(and ,@(map car conditions))
+                 (append-map cdr conditions)))))
+
+;; order can be: symbol | (asc symbol) | (desc symbol). Model fields are
+;; converted from kebab-case to snake_case, anything else passes through.
+(define (convert-order-field order columns)
+  (let ((convert (lambda (field)
+                   (if (member field columns) (symbol->db-column field) field))))
+    (cond
+     ((not order) #f)
+     ((list? order) (list (car order) (convert (cadr order))))
+     (else (convert order)))))
+
+;; Returns (values ssql params). The model scope is applied here, at run time
+;; and last, so it is always ANDed in and its procedure sees the caller's
+;; parameterize. A scope that cannot produce a condition fails closed.
+(define (render-model-query q)
+  (let-values (((conditions vals)
+                (combine-query-conditions (model-query-conditions q))))
+    (let-values (((scoped-conditions scoped-values)
+                  (apply-model-scope-condition (model-query-scope q) conditions vals)))
+      (let* ((columns (map car ((model-query-columns q))))
+             (db-table-name (symbol->db-column (model-query-table q)))
+             (where-part (if scoped-conditions
+                             `((where ,(map-field-names->columns scoped-conditions columns)))
+                             '())))
+        (values
+         (if (eq? (model-query-shape q) 'count)
+             `(select (columns (as (count *) _count))
+                (from ,db-table-name)
+                ,@where-part)
+             (let ((order (convert-order-field (model-query-order q) columns))
+                   (limit (model-query-limit q))
+                   (offset (model-query-offset q)))
+               `(select (columns ,@(map symbol->db-column columns))
+                  (from ,db-table-name)
+                  ,@where-part
+                  ,@(if order `((order ,order)) '())
+                  ,@(if limit `((limit ,limit)) '())
+                  ,@(if offset `((offset ,offset)) '()))))
+         scoped-values)))))
+
+;; Shape the raw row vector, then apply the q/then procedures.
+(define (finalize-model-query q rows)
+  (let ((single (and (vector? rows)
+                     (> (vector-length rows) 0)
+                     (vector-ref rows 0))))
+    (fold (lambda (proc acc) (proc acc))
+          (case (model-query-shape q)
+            ((first) (and single (convert-result-keys single)))
+            ((count) (if single (alist-ref '_count single) 0))
+            (else (convert-results-vector rows)))
+          (model-query-thens q))))
+
+(define (q/run q)
+  (check-model-query q)
+  (let-values (((query params) (render-model-query q)))
+    (finalize-model-query q (db/query query params))))
+
+;; Everything is rendered before anything is sent, so a scope error in one
+;; descriptor aborts the whole batch without a request.
+(define (q/run-list qs)
+  (for-each check-model-query qs)
+  (let ((statements (map (lambda (q)
+                           (call-with-values (lambda () (render-model-query q)) cons))
+                         qs)))
+    (map finalize-model-query qs (db/batch statements))))
+
+(define (q/run-all . qs)
+  (apply values (q/run-list qs)))
+
 ;; Model metadata management
 (define (register-model! name metadata)
   (set! *model-registry*
@@ -342,10 +503,7 @@
             (load-metadata-name (string->symbol (conc table-name-str "/load-metadata")))
             (columns-name (string->symbol (conc table-name-str "/columns")))
             (pkey-name (string->symbol (conc table-name-str "/pkey")))
-            (where-name (string->symbol (conc table-name-str "/where")))
-            (all-name (string->symbol (conc table-name-str "/all")))
-            (find-name (string->symbol (conc table-name-str "/find")))
-            (count-name (string->symbol (conc table-name-str "/count")))
+            (q-name (string->symbol (conc table-name-str "/q")))
             (create-name (string->symbol (conc table-name-str "/create")))
             (save-name (string->symbol (conc table-name-str "/save")))
             (update-name (string->symbol (conc table-name-str "/update")))
@@ -364,7 +522,7 @@
        `(,(r 'begin)
          ;; Export all generated functions (must be at module toplevel)
          (,(r 'export) ,load-metadata-name ,columns-name ,pkey-name
-          ,where-name ,all-name ,find-name ,count-name ,create-name ,save-name ,update-name ,delete-name
+          ,q-name ,create-name ,save-name ,update-name ,delete-name
           ,hooks-name)
 
          ;; Scope policy is private to the model's module. #f preserves the
@@ -391,64 +549,10 @@
          (,%define (,pkey-name)
                    (,%map ,%car (get-primary-key-columns (,columns-name))))
 
-         ;; Where function - returns vector of alists
-         (,%define (,where-name #!optional conditions (values '()) #!key (limit #f) (order #f) (offset #f))
-                   (,(r 'let-values) (((scoped-conditions scoped-values)
-                                       (apply-model-scope-condition ,scope-name conditions values)))
-                   (,%let* ((columns (,%map ,%car (,columns-name)))
-                            (db-columns (,%map (,(r 'lambda) (col-spec)
-                                                (symbol->db-column col-spec)) columns))
-                            (db-table-name (symbol->db-column ',table-name))
-                            ;; Convert order field from kebab-case to snake_case
-                            ;; order can be: symbol | (asc symbol) | (desc symbol)
-                            (converted-order
-                             (,(r 'if) order
-                                       (,(r 'if) (,(r 'list?) order)
-                                                 ;; (asc/desc field-name) - convert cadr
-                                                 (,(r 'list) (,(r 'car) order)
-                                                             (,(r 'if) (,(r 'member) (,(r 'cadr) order) columns)
-                                                                       (symbol->db-column (,(r 'cadr) order))
-                                                                       (,(r 'cadr) order)))
-                                                 ;; just field-name - convert it
-                                                 (,(r 'if) (,(r 'member) order columns)
-                                                           (symbol->db-column order)
-                                                           order))
-                                       #f))
-                            (query-parts `(select (columns ,@db-columns)
-                                            (from ,db-table-name)
-                                            ,@(,(r 'if) scoped-conditions `((where ,(map-field-names->columns scoped-conditions columns))) '())
-                                            ,@(,(r 'if) converted-order `((order ,converted-order)) '())
-                                            ,@(,(r 'if) limit `((limit ,limit)) '())
-                                            ,@(,(r 'if) offset `((offset ,offset)) '()))))
-                           (convert-results-vector (db/query query-parts scoped-values)))))
-
-         ;; Convenience "all" search
-         (,%define (,all-name #!key (limit #f) (order #f) (offset #f))
-                   (,where-name #f '() limit: limit order: order offset: offset))
-
-         ;; Find function - returns single alist or #f
-         (,%define (,find-name #!optional conditions (values '()) #!key (order #f))
-                   (,%let ((results (,where-name conditions values limit: 1 order: order)))
-		          (,%if (,(r 'and) (,(r 'vector?) results) (,(r 'eq?) (,(r 'vector-length) results) 1))
-		                (,(r 'vector-ref) results 0)
-		                #f)))
-
-         ;; Count function - returns integer count of matching rows
-         (,%define (,count-name #!optional conditions (values '()))
-                   (,(r 'let-values) (((scoped-conditions scoped-values)
-                                       (apply-model-scope-condition ,scope-name conditions values)))
-                   (,%let* ((columns (,columns-name))
-                            (db-columns (,%map (,(r 'lambda) (col-spec)
-                                                (symbol->db-column col-spec)) (,%map ,%car columns)))
-                            (db-table-name (symbol->db-column ',table-name))
-                            (query-parts `(select (columns (as (count *) _count))
-                                            (from ,db-table-name)
-                                            ,@(,(r 'if) scoped-conditions `((where ,(map-field-names->columns scoped-conditions (,%map ,%car columns)))) '())))
-                            (result (db/query query-parts scoped-values)))
-                           ;; Safely extract count - handle empty result or errors
-                           (,%if (,(r 'and) result (,(r 'vector?) result) (,(r 'eq?) (,(r 'vector-length) result) 1))
-                                 (,(r 'alist-ref) '_count (,(r 'vector-ref) result 0))
-                                 0))))
+         ;; Query descriptor for this model: build with q/where, q/order,
+         ;; ..., run with q/run or q/run-all. The scope applies at run time.
+         (,%define (,q-name)
+                   (make-model-query ',table-name ,columns-name ,scope-name))
 
          ;; Create function - takes alist, returns alist of created row
          (,%define (,create-name row-alist)
@@ -469,9 +573,9 @@
 					    (values #(,@placeholders))))
 			    (new_id (db/execute query values 'last_insert_id))
 			    ;; Re-read the created row by its new ID. This goes
-			    ;; through find, so it is scoped: an out-of-scope
+			    ;; through the model query, so it is scoped: an out-of-scope
 			    ;; insert comes back #f and after-create is skipped.
-			    (created-row (,find-name '(= rowid ?) (,(r 'list) new_id))))
+			    (created-row (q/run (q/first (q/where (,q-name) '(= rowid ?) new_id)))))
 			   ;; returns created-row, and warns instead of running the
 			   ;; hooks when the insert landed outside the scope
 			   (run-after-hooks ,hooks-var-name 'after-create created-row)))
@@ -513,11 +617,11 @@
                                     ;; UPDATE matched nothing
                                     (run-after-hooks
                                      ,hooks-var-name 'after-save
-                                     (,find-name '(= id ?) (,(r 'list) (,(r 'alist-ref) 'id prepared-row)))))))))
+                                     (q/run (q/by-id (,q-name) (,(r 'alist-ref) 'id prepared-row)))))))))
 
-         ;; update function, wrapper around find -> save
+         ;; update function, wrapper around lookup by id -> save
          (,%define (,update-name id updates)
-                   (,%let ((row (,find-name '(= id ?) (,(r 'list) id))))
+                   (,%let ((row (q/run (q/by-id (,q-name) id))))
                           (,%if row
                                 (,save-name (,(r 'fold) (,(r 'lambda) (pair acc)
                                                           (,(r 'alist-update) (,(r 'car) pair) (,(r 'cdr) pair) acc))
@@ -563,12 +667,11 @@
                                 parent-str))
             (fk-column (string->symbol (conc parent-singular "-id")))
             ;; Generate function names
-            (parent-get-children-name (string->symbol (conc parent-str "/" child-str)))
-            (child-get-parent-name (string->symbol (conc child-str "/" parent-str)))
+            (parent-get-children-name (string->symbol (conc parent-str "/" child-str "/q")))
+            (child-get-parent-name (string->symbol (conc child-str "/" parent-str "/q")))
             (parent-add-child-name (string->symbol (conc parent-str "/add-" child-str)))
-            (parent-find-name (string->symbol (conc parent-str "/find")))
-            (child-where-name (string->symbol (conc child-str "/where")))
-            (child-find-name (string->symbol (conc child-str "/find")))
+            (parent-q-name (string->symbol (conc parent-str "/q")))
+            (child-q-name (string->symbol (conc child-str "/q")))
             (child-save-name (string->symbol (conc child-str "/save")))
 	    (%let  (r 'let))
 	    (%let* (r 'let*)))
@@ -577,26 +680,21 @@
          ;; Export relationship functions
          (,(r 'export) ,parent-get-children-name ,child-get-parent-name ,parent-add-child-name)
 
-         ;; Parent -> Children (e.g., users/sessions) - returns list
-         (,(r 'define) (,parent-get-children-name parent-row #!optional conditions (values '()) #!key (limit #f) (order #f) (offset #f))
-          (,%let* ((fk-column ',fk-column)
-		   (parent-pk (,(r 'alist-ref) 'id parent-row))
-                   (base-condition `(= ,fk-column ?))
-                   (base-values (,(r 'list) parent-pk))
-                   (full-condition (,(r 'if) conditions
-                                    `(and ,base-condition ,conditions)
-                                    base-condition))
-                   (full-values (,(r 'if) conditions
-                                 (,(r 'append) base-values values)
-                                 base-values)))
-		  (,child-where-name full-condition full-values limit: limit order: order offset: offset)))
+         ;; Parent -> Children (e.g., users/sessions/q) - a query descriptor
+         ;; for the child rows; refine it with q/ and run it with q/run.
+         (,(r 'define) (,parent-get-children-name parent-row)
+          (q/where (,child-q-name) '(= ,fk-column ?) (,(r 'alist-ref) 'id parent-row)))
 
-         ;; Child -> Parent (e.g., sessions/user) - returns single element or #f
+         ;; Child -> Parent (e.g., sessions/user/q) - a q/first descriptor, so it
+         ;; runs to a single row or #f. A missing (or NULL) foreign key still
+         ;; yields a descriptor, one that matches nothing, so it stays batchable.
          (,(r 'define) (,child-get-parent-name child-row)
           (,%let ((fk-value (,(r 'alist-ref) ',fk-column child-row)))
-		 (,(r 'if) fk-value
-                  (,parent-find-name `(= id ?) (,(r 'list) fk-value))
-                  #f)))
+		 (,(r 'if) (,(r 'and) fk-value
+                            (,(r 'not) (,(r 'eq?) fk-value 'null))
+                            (,(r 'not) (,(r 'sql-null?) fk-value)))
+                  (q/by-id (,parent-q-name) fk-value)
+                  (q/first (q/where (,parent-q-name) '(= 1 0))))))
 
          ;; Add relationship (e.g., users/add-session)
          (,(r 'define) (,parent-add-child-name parent-row child-row)

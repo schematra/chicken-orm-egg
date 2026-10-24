@@ -1,7 +1,7 @@
 ;; orm-db.scm - Abstract database interface
 ;; Provides a backend-agnostic interface for database operations.
 ;; Backends (like orm-db-sqlite or orm-db-rqlite) register themselves and
-;; implement connect, close, query, and execute operations.
+;; implement connect, close, query, and execute operations (and optionally batch).
 
 (module orm-db
 
@@ -13,6 +13,7 @@
  db/close
  db/query
  db/execute
+ db/batch
  )
 
 (import
@@ -24,6 +25,8 @@
 ;;   close: (connection) -> void
 ;;   query: (connection ssql-or-string params) -> vector of alists
 ;;   execute: (connection ssql-or-string params out-key) -> value
+;;   batch (optional): (connection statements) -> list of row vectors, where
+;;     statements is a list of (ssql-or-string . params). Reads only.
 (define db/backend (make-parameter #f))
 
 ;; Current database connection (opaque, backend-specific)
@@ -80,5 +83,23 @@
       (unless execute-proc
         (error "Backend does not implement 'execute'"))
       (execute-proc conn ssql-form-or-string params out-key))))
+
+;; Run several read statements, returns a list of row vectors in order.
+;; statements is a list of (ssql-or-string . params). Backends with a native
+;; 'batch' (rqlite) send them in one request; others run them one by one.
+(define (db/batch statements)
+  (let ((backend (db/backend))
+        (conn (db/connection)))
+    (unless backend
+      (error "No database backend configured"))
+    (unless conn
+      (error "No database connection. Call (db/connect) first."))
+    (let ((batch-proc (alist-ref 'batch backend))
+          (query-proc (alist-ref 'query backend)))
+      (cond
+       ((null? statements) '())
+       (batch-proc (batch-proc conn statements))
+       (query-proc (map (lambda (s) (query-proc conn (car s) (cdr s))) statements))
+       (else (error "Backend does not implement 'query'"))))))
 
 )

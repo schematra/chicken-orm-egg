@@ -31,7 +31,7 @@ chicken-install orm-db-rqlite
 (db/connect)
 
 (define-model users)
-(users/all)
+(q/run (users/q))
 
 (db/close)   ; no-op for rqlite
 ```
@@ -47,7 +47,7 @@ The `db/path` value is the base HTTP URL of the rqlite node, optionally includin
 
 #### `(rqlite-backend)`
 
-Returns a backend alist implementing the `orm-db` protocol — the keys `connect`, `close`, `query`, and `execute` — backed by rqlite's HTTP API. Pass the result to `db/backend`.
+Returns a backend alist implementing the `orm-db` protocol (the keys `connect`, `close`, `query`, `execute`, and `batch`), backed by rqlite's HTTP API. Pass the result to `db/backend`.
 
 ```scheme
 (db/backend (rqlite-backend))
@@ -59,6 +59,23 @@ The backend procedures are used by `orm-db`; you do not normally call them direc
 - **close**: no-op
 - **query**: POSTs a SELECT to `/db/request`, returning a vector of alists (rqlite's `associative` mode yields rows keyed by column name)
 - **execute**: POSTs a statement and returns the requested output value; rqlite errors are raised as a CHICKEN `(error 'rqlite ...)` condition
+- **batch**: POSTs several SELECTs in one request and returns a list of row vectors, one per statement (see Batching below)
+
+## Batching
+
+Several independent reads can share one HTTP round trip. `q/run-all` and `q/run-list` (from `orm`) and `db/batch` (from `orm-db`) hand all their statements to this backend's `batch` entry, which sends them in a single POST to `/db/request` as one JSON array, `[[sql, param, ...], [sql, param, ...], ...]`, and returns the results in statement order.
+
+```scheme
+(receive (user recent unread)
+    (q/run-all (q/by-id (users/q) uid)
+               (q/limit (q/order (posts/q) '(desc created-at)) 10)
+               (q/count (q/where (notifications/q) '(= user-id ?) uid)))
+  ...)   ; one request instead of three
+```
+
+- No `transaction` flag is sent, so each statement runs on its own; a batch is a latency optimization, not an atomic unit.
+- Batches are for reads only.
+- If any statement fails, the error is logged with its statement index and the whole batch raises an `(error 'rqlite ...)` condition; no partial results are returned.
 
 ## SQL Dialect
 
@@ -66,7 +83,7 @@ The backend includes the `sqlite3` `ssql` dialect and registers an `rqlite` dial
 
 ## Notes on Distributed Use
 
-- Every `db/query` / `db/execute` is an independent HTTP round-trip; there is no client-side transaction state.
+- Every `db/query` / `db/execute` is an independent HTTP round-trip; there is no client-side transaction state. Use `q/run-all` to fold several reads into one request.
 - Because the connection is just a base URL, the same model code works unchanged against a single rqlite node or a multi-node cluster behind a load balancer.
 - This backend pairs naturally with the `orm-migrate` CLI (see [`orm`](orm.md)): `orm-migrate -b rqlite -path "https://user:pass@host:4001" -f migrations.scm`.
 

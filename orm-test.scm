@@ -18,6 +18,7 @@
   (define (make-mock-backend)
     (let ((queries '())
           (executions '())
+          (batches '())
           (query-handler (lambda (sql params) (vector)))
           (execute-handler (lambda (sql params out-key) 0)))
 
@@ -25,18 +26,26 @@
         (case msg
           ((queries) queries)
           ((executions) executions)
+          ((batches) batches)
           ((on-query) (set! query-handler (make-response-handler (car args))))
           ((on-execute) (set! execute-handler (make-response-handler (car args))))
-          ((reset!) (set! queries '()) (set! executions '()))))
+          ((reset!) (set! queries '()) (set! executions '()) (set! batches '()))))
+
+      (define (run-query sql params)
+        (set! queries (cons (list sql params) queries))
+        (query-handler sql params))
 
       (define backend
         `((connect . ,(lambda (path) 'mock-connection))
           (close   . ,(lambda (conn) #f))
-          (query   . ,(lambda (conn sql params)
-                        (set! queries (cons (list sql params) queries))
-                        (query-handler sql params)))
+          (query   . ,(lambda (conn sql params) (run-query sql params)))
           (execute . ,(lambda (conn sql params out-key)
                         (set! executions (cons (list sql params out-key) executions))
-                        (execute-handler sql params out-key)))))
+                        (execute-handler sql params out-key)))
+          ;; Each batch is recorded whole in 'batches, and every statement
+          ;; in it also goes through the query handler (and 'queries).
+          (batch   . ,(lambda (conn statements)
+                        (set! batches (cons statements batches))
+                        (map (lambda (s) (run-query (car s) (cdr s))) statements)))))
 
       (values backend spy))))

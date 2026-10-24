@@ -121,6 +121,41 @@
     (db/connection #f)
     (db/path #f)))
 
+;; --- db/batch ---
+
+(test-group "db/batch"
+  (db/backend #f)
+  (db/connection #f)
+
+  (test-error "db/batch errors without backend"
+    (db/batch '(("SELECT 1"))))
+
+  (test "falls back to query per statement when the backend lacks batch"
+    '((#(((sql . "Q1") (params 1))) #(((sql . "Q2") (params))))
+      ("Q1" "Q2"))
+    (let ((calls '()))
+      (parameterize ((db/backend
+                      `((query . ,(lambda (conn sql params)
+                                    (set! calls (cons sql calls))
+                                    (vector `((sql . ,sql) (params . ,params)))))))
+                     (db/connection 'conn))
+        (list (db/batch '(("Q1" 1) ("Q2")))
+              (reverse calls)))))
+
+  (test "uses the backend's native batch when present"
+    '(1 ("Q1" "Q2"))
+    (let-values (((backend spy) (make-mock-backend)))
+      (parameterize ((db/backend backend) (db/connection 'conn))
+        (db/batch '(("Q1" 1) ("Q2")))
+        (list (length (spy 'batches))
+              (map car (reverse (spy 'queries)))))))
+
+  (test "an empty batch returns no results without calling the backend"
+    '()
+    (parameterize ((db/backend `((batch . ,(lambda (conn s) (error "called")))))
+                   (db/connection 'conn))
+      (db/batch '()))))
+
 ;; --- Integration with real SQLite backend ---
 
 (test-group "orm-db sqlite integration"
@@ -158,6 +193,12 @@
 
   (test "execute returns rows affected for delete"
     1 (db/execute "DELETE FROM test_table WHERE id = ?" '(1) 'rows_affected))
+
+  (test "db/batch runs each statement through the sqlite fallback"
+    '(1 0)
+    (map vector-length
+         (db/batch '(("SELECT * FROM test_table WHERE value = ?" "world")
+                     ("SELECT * FROM test_table WHERE value = ?" "nope")))))
 
   (db/close)
 

@@ -82,6 +82,23 @@
           '("INSERT" ("a") last_insert_id) (car (spy 'executions)))
         (db/close))))
 
+  (test-group "spy batches log"
+    (let-values (((backend spy) (make-mock-backend)))
+      (spy 'on-query (lambda (sql params) (vector `((sql . ,sql)))))
+      (parameterize ((db/backend backend) (db/path "mock"))
+        (db/connect)
+        (let ((results (db/batch '(("Q1" 1) ("Q2" 2 3)))))
+          (test "batch answers each statement through the query handler"
+            '("Q1" "Q2")
+            (map (lambda (rows) (alist-ref 'sql (vector-ref rows 0))) results)))
+        (test "batches log has 1 entry"
+          1 (length (spy 'batches)))
+        (test "batch log entry holds the statements"
+          '(("Q1" 1) ("Q2" 2 3)) (car (spy 'batches)))
+        (test "batched statements are also logged as queries"
+          '(("Q2" (2 3)) ("Q1" (1))) (spy 'queries))
+        (db/close))))
+
   (test-group "spy reset!"
     (let-values (((backend spy) (make-mock-backend)))
       (parameterize ((db/backend backend) (db/path "mock"))
@@ -93,4 +110,8 @@
           '() (spy 'queries))
         (test "executions cleared after reset"
           '() (spy 'executions))
+        (db/batch '(("SELECT 1")))
+        (spy 'reset!)
+        (test "batches cleared after reset"
+          '() (spy 'batches))
         (db/close)))))

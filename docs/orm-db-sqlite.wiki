@@ -29,7 +29,7 @@ chicken-install orm-db-sqlite
 (db/connect)
 
 (define-model users)
-(users/all)
+(q/run (users/q))
 
 (db/close)
 </enscript>
